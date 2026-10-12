@@ -1,0 +1,7 @@
+{
+  "name": "Expense Splitter",
+  "description": "Fast, accurate dinner bill and expense splitter that calculates exact shares with zero rounding discrepancy.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
