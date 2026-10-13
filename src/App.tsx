@@ -35,7 +35,13 @@ import {
   ExternalLink,
   Laptop,
   CloudCheck,
-  Edit3
+  Edit3,
+  Bell,
+  BellRing,
+  AlertTriangle,
+  SlidersHorizontal,
+  X,
+  ShieldAlert
 } from 'lucide-react';
 import QRCode from 'qrcode';
 import {
@@ -51,10 +57,10 @@ import { onAuthStateChanged, User as FirebaseUser } from 'firebase/auth';
 import { collection, doc, setDoc, deleteDoc, onSnapshot } from 'firebase/firestore';
 
 // Storage keys
-const ACTIVE_STORAGE_KEY = 'expense_splitter_active_data_v5';
-const HISTORY_STORAGE_KEY = 'expense_splitter_history_v5';
-const THEME_STORAGE_KEY = 'expense_splitter_theme_v5';
-const UPI_STORAGE_KEY = 'expense_splitter_upi_ids_v5';
+const ACTIVE_STORAGE_KEY = 'expense_splitter_active_data_v6';
+const HISTORY_STORAGE_KEY = 'expense_splitter_history_v6';
+const THEME_STORAGE_KEY = 'expense_splitter_theme_v6';
+const UPI_STORAGE_KEY = 'expense_splitter_upi_ids_v6';
 
 export interface HistoryItem {
   id: string;
@@ -67,6 +73,20 @@ export interface HistoryItem {
   settlements: { from: string; to: string; amount: number; isSettled: boolean }[];
   isFullySettled: boolean;
   ownerId?: string;
+}
+
+export interface InAppNotification {
+  id: string;
+  type: 'imbalance_flag';
+  title: string;
+  message: string;
+  participantName: string;
+  shareAmount: number;
+  totalBill: number;
+  percentage: number;
+  threshold: number;
+  timestamp: number;
+  isRead: boolean;
 }
 
 // Safely load active bill from localStorage
@@ -180,6 +200,15 @@ export default function App() {
   // Modals state
   const [showServerModal, setShowServerModal] = useState<boolean>(false);
   const [showDownloadModal, setShowDownloadModal] = useState<boolean>(false);
+  const [showNotificationsMenu, setShowNotificationsMenu] = useState<boolean>(false);
+
+  // Imbalance threshold percentage (e.g. 50%)
+  const [imbalanceThreshold, setImbalanceThreshold] = useState<number>(50);
+  const [dismissedNotificationIds, setDismissedNotificationIds] = useState<Record<string, boolean>>({});
+
+  // Split mode: 'equal' or 'custom' (allows unequal shares so imbalances can be adjusted or assigned)
+  const [splitMode, setSplitMode] = useState<'equal' | 'custom'>('equal');
+  const [customShareInputs, setCustomShareInputs] = useState<Record<number, string>>({});
 
   // UPI QR Code Modal State
   const [selectedUpiModal, setSelectedUpiModal] = useState<{
@@ -196,7 +225,6 @@ export default function App() {
   // UPI IDs mapped by participant name
   const [upiIds, setUpiIds] = useState<Record<string, string>>(() => getStoredUpiIds());
 
-  // Save UPI IDs to localStorage
   useEffect(() => {
     try {
       localStorage.setItem(UPI_STORAGE_KEY, JSON.stringify(upiIds));
@@ -219,7 +247,6 @@ export default function App() {
     return 'light';
   });
 
-  // Apply theme class to document
   useEffect(() => {
     try {
       if (theme === 'dark') {
@@ -238,12 +265,10 @@ export default function App() {
     setTheme((prev) => (prev === 'light' ? 'dark' : 'light'));
   };
 
-  // Test Firestore connection on boot
   useEffect(() => {
     testConnection();
   }, []);
 
-  // Listen to Firebase Auth state
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (user) => {
       setCurrentUser(user);
@@ -272,7 +297,6 @@ export default function App() {
     return () => unsubscribe();
   }, []);
 
-  // Load initial stored active state synchronously (IMMUNE TO PAGE RELOAD)
   const initialActive = useMemo(() => getStoredActiveData(), []);
 
   // Core input states
@@ -286,13 +310,11 @@ export default function App() {
     () => initialActive?.participantsCountInput ?? '4'
   );
 
-  // Optional tip state
   const [tipPercent, setTipPercent] = useState<number>(() => initialActive?.tipPercent ?? 0);
   const [customTipInput, setCustomTipInput] = useState<string>(
     () => initialActive?.customTipInput ?? ''
   );
 
-  // Payer selection or custom payments mode
   const [payerMode, setPayerMode] = useState<'single' | 'custom'>(
     () => initialActive?.payerMode ?? 'single'
   );
@@ -303,7 +325,6 @@ export default function App() {
     () => initialActive?.customPaidAmounts ?? {}
   );
 
-  // Participant names
   const [participantNames, setParticipantNames] = useState<Record<number, string>>(
     () =>
       initialActive?.participantNames ?? {
@@ -314,26 +335,21 @@ export default function App() {
       }
   );
 
-  // "Mark as Paid" status tracking per participant
   const [markedAsPaid, setMarkedAsPaid] = useState<Record<number, boolean>>(
     () => initialActive?.markedAsPaid ?? {}
   );
 
-  // Split calculation submitted state
   const [hasSplitSubmitted, setHasSplitSubmitted] = useState<boolean>(
     () => initialActive?.hasSplitSubmitted ?? true
   );
 
-  // Toggle for "Show what each person paid" view
   const [showPaidBreakdown, setShowPaidBreakdown] = useState<boolean>(
     () => initialActive?.showPaidBreakdown ?? true
   );
 
-  // Split History State
   const [historyList, setHistoryList] = useState<HistoryItem[]>(() => getStoredHistory());
   const [historySearchQuery, setHistorySearchQuery] = useState<string>('');
 
-  // Real-time Firestore sync for Split History when authenticated
   useEffect(() => {
     if (!currentUser) return;
 
@@ -373,7 +389,6 @@ export default function App() {
     return () => unsubscribe();
   }, [currentUser]);
 
-  // Toast notification
   const [copied, setCopied] = useState<boolean>(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
@@ -382,10 +397,8 @@ export default function App() {
     setTimeout(() => setToastMessage(null), 3000);
   };
 
-  // Ref to results section for smooth scrolling
   const resultsRef = useRef<HTMLDivElement>(null);
 
-  // Always save active state to localStorage
   useEffect(() => {
     try {
       const dataToSave = {
@@ -401,6 +414,8 @@ export default function App() {
         markedAsPaid,
         hasSplitSubmitted,
         showPaidBreakdown,
+        splitMode,
+        imbalanceThreshold,
       };
       localStorage.setItem(ACTIVE_STORAGE_KEY, JSON.stringify(dataToSave));
     } catch (e) {
@@ -419,9 +434,10 @@ export default function App() {
     markedAsPaid,
     hasSplitSubmitted,
     showPaidBreakdown,
+    splitMode,
+    imbalanceThreshold,
   ]);
 
-  // Save history to localStorage
   useEffect(() => {
     try {
       localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(historyList));
@@ -430,16 +446,13 @@ export default function App() {
     }
   }, [historyList]);
 
-  // Parse numeric values
   const rawBill = parseFloat(billAmountInput);
   const rawCount = parseInt(participantsCountInput, 10);
 
-  // Strict validation
   const isBillInvalid = isNaN(rawBill) || rawBill <= 0 || billAmountInput.trim() === '';
   const isCountInvalid = isNaN(rawCount) || rawCount <= 0 || participantsCountInput.trim() === '';
   const isInvalid = isBillInvalid || isCountInvalid;
 
-  // Tip calculation
   const tipAmount = useMemo(() => {
     if (isBillInvalid) return 0;
     if (customTipInput && !isNaN(parseFloat(customTipInput)) && parseFloat(customTipInput) >= 0) {
@@ -451,7 +464,6 @@ export default function App() {
     return 0;
   }, [rawBill, tipPercent, customTipInput, isBillInvalid]);
 
-  // Total bill to split
   const totalBillToSplit = useMemo(() => {
     if (isBillInvalid) return 0;
     return rawBill + tipAmount;
@@ -464,31 +476,72 @@ export default function App() {
     const totalPaise = Math.round(totalBillToSplit * 100);
     const count = rawCount;
 
-    const baseSharePaise = Math.floor(totalPaise / count);
-    const remainderPaise = totalPaise % count;
-
     const shares: {
       index: number;
       name: string;
       share: number;
       sharePaise: number;
+      percentage: number;
       getsExtraPaise: boolean;
       isPaid: boolean;
+      isImbalanced: boolean;
     }[] = [];
 
-    for (let i = 0; i < count; i++) {
-      const extra = i < remainderPaise;
-      const sharePaise = baseSharePaise + (extra ? 1 : 0);
-      const name = participantNames[i]?.trim() || `Participant ${i + 1}`;
-      const isPaid = !!markedAsPaid[i];
-      shares.push({
-        index: i,
-        name,
-        share: sharePaise / 100,
-        sharePaise,
-        getsExtraPaise: extra,
-        isPaid,
-      });
+    if (splitMode === 'equal') {
+      const baseSharePaise = Math.floor(totalPaise / count);
+      const remainderPaise = totalPaise % count;
+
+      for (let i = 0; i < count; i++) {
+        const extra = i < remainderPaise;
+        const sharePaise = baseSharePaise + (extra ? 1 : 0);
+        const name = participantNames[i]?.trim() || `Participant ${i + 1}`;
+        const isPaid = !!markedAsPaid[i];
+        const share = sharePaise / 100;
+        const percentage = totalBillToSplit > 0 ? (share / totalBillToSplit) * 100 : 0;
+        const isImbalanced = percentage > imbalanceThreshold;
+
+        shares.push({
+          index: i,
+          name,
+          share,
+          sharePaise,
+          percentage,
+          getsExtraPaise: extra,
+          isPaid,
+          isImbalanced,
+        });
+      }
+    } else {
+      // Custom / Itemized shares
+      let customPaiseSum = 0;
+      const parsedCustomShares: number[] = [];
+
+      for (let i = 0; i < count; i++) {
+        const val = parseFloat(customShareInputs[i] || '0');
+        const paise = !isNaN(val) && val >= 0 ? Math.round(val * 100) : 0;
+        parsedCustomShares.push(paise);
+        customPaiseSum += paise;
+      }
+
+      for (let i = 0; i < count; i++) {
+        const sharePaise = parsedCustomShares[i];
+        const name = participantNames[i]?.trim() || `Participant ${i + 1}`;
+        const isPaid = !!markedAsPaid[i];
+        const share = sharePaise / 100;
+        const percentage = totalBillToSplit > 0 ? (share / totalBillToSplit) * 100 : 0;
+        const isImbalanced = percentage > imbalanceThreshold;
+
+        shares.push({
+          index: i,
+          name,
+          share,
+          sharePaise,
+          percentage,
+          getsExtraPaise: false,
+          isPaid,
+          isImbalanced,
+        });
+      }
     }
 
     const calculatedSumPaise = shares.reduce((acc, curr) => acc + curr.sharePaise, 0);
@@ -498,20 +551,93 @@ export default function App() {
     const paidCount = shares.filter((s) => s.isPaid).length;
     const paidAmount = shares.filter((s) => s.isPaid).reduce((acc, s) => acc + s.share, 0);
 
+    // Identify participants exceeding the imbalance threshold (e.g. > 50%)
+    const imbalancedShares = shares.filter((s) => s.isImbalanced);
+
     return {
       totalPaise,
       totalBill: totalBillToSplit,
       count,
-      baseShare: baseSharePaise / 100,
-      remainderPaise,
       shares,
       calculatedSum,
       isExactMatch,
       paidCount,
       paidAmount,
       progressPercent: count > 0 ? Math.round((paidCount / count) * 100) : 0,
+      imbalancedShares,
+      hasImbalance: imbalancedShares.length > 0,
     };
-  }, [isInvalid, totalBillToSplit, rawCount, participantNames, markedAsPaid]);
+  }, [
+    isInvalid,
+    totalBillToSplit,
+    rawCount,
+    participantNames,
+    markedAsPaid,
+    splitMode,
+    customShareInputs,
+    imbalanceThreshold,
+  ]);
+
+  // IN-APP NOTIFICATION SYSTEM: Generate active cost imbalance notifications
+  const activeNotifications = useMemo<InAppNotification[]>(() => {
+    if (!shareCalculation || !shareCalculation.hasImbalance) return [];
+
+    return shareCalculation.imbalancedShares
+      .map((s) => {
+        const notifId = `imbalance-${s.index}-${s.share.toFixed(0)}-${imbalanceThreshold}`;
+        return {
+          id: notifId,
+          type: 'imbalance_flag' as const,
+          title: `Cost Imbalance Alert: ${s.name}`,
+          message: `${s.name}'s share is ${formatRupee(s.share)} (${s.percentage.toFixed(
+            1
+          )}% of the total ${formatRupee(
+            shareCalculation.totalBill
+          )} bill). This exceeds your ${imbalanceThreshold}% threshold.`,
+          participantName: s.name,
+          shareAmount: s.share,
+          totalBill: shareCalculation.totalBill,
+          percentage: s.percentage,
+          threshold: imbalanceThreshold,
+          timestamp: Date.now(),
+          isRead: !!dismissedNotificationIds[notifId],
+        };
+      })
+      .filter((n) => !dismissedNotificationIds[n.id]);
+  }, [shareCalculation, imbalanceThreshold, dismissedNotificationIds]);
+
+  const unreadCount = activeNotifications.length;
+
+  const dismissNotification = (id: string) => {
+    setDismissedNotificationIds((prev) => ({ ...prev, [id]: true }));
+    showToast('Notification dismissed');
+  };
+
+  const clearAllNotifications = () => {
+    const updated: Record<string, boolean> = { ...dismissedNotificationIds };
+    activeNotifications.forEach((n) => {
+      updated[n.id] = true;
+    });
+    setDismissedNotificationIds(updated);
+    setShowNotificationsMenu(false);
+    showToast('All alerts cleared');
+  };
+
+  // Quick balancing helper for custom shares
+  const handleAutoBalanceRemaining = () => {
+    if (!shareCalculation) return;
+    const totalPaise = Math.round(totalBillToSplit * 100);
+    const count = rawCount;
+    const base = Math.floor(totalPaise / count);
+    const rem = totalPaise % count;
+    const newInputs: Record<number, string> = {};
+    for (let i = 0; i < count; i++) {
+      const paise = base + (i < rem ? 1 : 0);
+      newInputs[i] = (paise / 100).toFixed(2);
+    }
+    setCustomShareInputs(newInputs);
+    showToast('Shares reset to balanced equal split');
+  };
 
   // Calculate payments and net balances
   const paymentBreakdown = useMemo(() => {
@@ -611,7 +737,6 @@ export default function App() {
     };
   }, [shareCalculation, rawCount, totalBillToSplit, payerMode, singlePayerIndex, customPaidAmounts, markedAsPaid]);
 
-  // Format currency in Indian Rupees format
   const formatRupee = (amount: number) => {
     return `₹${amount.toLocaleString('en-IN', {
       minimumFractionDigits: 2,
@@ -619,7 +744,6 @@ export default function App() {
     })}`;
   };
 
-  // Google Login Handler
   const handleGoogleSignIn = async () => {
     try {
       await signInWithGoogle();
@@ -630,7 +754,6 @@ export default function App() {
     }
   };
 
-  // Log Out Handler
   const handleSignOut = async () => {
     try {
       await logOut();
@@ -640,10 +763,13 @@ export default function App() {
     }
   };
 
-  // Split Expense Trigger
   const handleSplitExpense = () => {
     setHasSplitSubmitted(true);
-    showToast('Split calculated with exact precision');
+    if (shareCalculation?.hasImbalance) {
+      showToast(`Warning: Share exceeds ${imbalanceThreshold}% threshold`);
+    } else {
+      showToast('Split calculated with exact precision');
+    }
     setTimeout(() => {
       if (resultsRef.current) {
         resultsRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -651,13 +777,11 @@ export default function App() {
     }, 50);
   };
 
-  // Refresh Trigger
   const handleRefreshData = () => {
     setHasSplitSubmitted(true);
     showToast('Ledger refreshed');
   };
 
-  // Clear All
   const handleClearAll = () => {
     try {
       localStorage.removeItem(ACTIVE_STORAGE_KEY);
@@ -672,12 +796,12 @@ export default function App() {
     setCustomPaidAmounts({});
     setParticipantNames({});
     setMarkedAsPaid({});
+    setCustomShareInputs({});
     setSinglePayerIndex(0);
     setHasSplitSubmitted(false);
     showToast('Active bill cleared');
   };
 
-  // Save to History (local + Firestore)
   const handleSaveToHistory = async () => {
     if (!shareCalculation || !paymentBreakdown) return;
 
@@ -724,7 +848,6 @@ export default function App() {
     }
   };
 
-  // Restore history record
   const handleRestoreHistoryItem = (item: HistoryItem) => {
     setOccasionName(item.occasion);
     setBillAmountInput(String(item.totalBill));
@@ -749,7 +872,6 @@ export default function App() {
     showToast(`Loaded ${item.occasion}`);
   };
 
-  // Delete history record
   const handleDeleteHistoryItem = async (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
     setHistoryList((prev) => prev.filter((item) => item.id !== id));
@@ -768,7 +890,6 @@ export default function App() {
     }
   };
 
-  // Toggle "Mark as Paid"
   const toggleMarkAsPaid = (index: number) => {
     setMarkedAsPaid((prev) => ({
       ...prev,
@@ -776,7 +897,6 @@ export default function App() {
     }));
   };
 
-  // Batch mark as paid
   const handleMarkAllPaid = (status: boolean) => {
     if (!shareCalculation) return;
     const updated: Record<number, boolean> = {};
@@ -786,8 +906,7 @@ export default function App() {
     setMarkedAsPaid(updated);
   };
 
-  // Presets
-  const handleLoadSample = (sampleType: 'biryani' | 'pizza' | 'team_lunch') => {
+  const handleLoadSample = (sampleType: 'biryani' | 'pizza' | 'imbalanced_dinner') => {
     if (sampleType === 'biryani') {
       setOccasionName('Biryani Night with Friends');
       setBillAmountInput('1850');
@@ -798,6 +917,7 @@ export default function App() {
       setMarkedAsPaid({ 0: true, 1: true });
       setSinglePayerIndex(0);
       setPayerMode('single');
+      setSplitMode('equal');
     } else if (sampleType === 'pizza') {
       setOccasionName('Friday Pizza Feast');
       setBillAmountInput('1240');
@@ -808,40 +928,49 @@ export default function App() {
       setMarkedAsPaid({ 1: true });
       setSinglePayerIndex(1);
       setPayerMode('single');
+      setSplitMode('equal');
     } else {
-      setOccasionName('Team Lunch at Barbeque');
-      setBillAmountInput('4650');
-      setParticipantsCountInput('6');
-      setTipPercent(10);
+      // Scenario demonstrating cost imbalance (>50%)
+      setOccasionName('Weekend Dinner & Drinks');
+      setBillAmountInput('3000');
+      setParticipantsCountInput('3');
+      setTipPercent(0);
       setCustomTipInput('');
-      setParticipantNames({
-        0: 'Vikram',
-        1: 'Neha',
-        2: 'Karan',
-        3: 'Pooja',
-        4: 'Suresh',
-        5: 'Divya',
+      setParticipantNames({ 0: 'Vikram', 1: 'Neha', 2: 'Karan' });
+      setSplitMode('custom');
+      setCustomShareInputs({
+        0: '1800', // Vikram is 60% of total bill (exceeds 50% threshold)
+        1: '600',
+        2: '600',
       });
-      setMarkedAsPaid({});
       setSinglePayerIndex(0);
       setPayerMode('single');
     }
     setHasSplitSubmitted(true);
     setActiveTab('splitter');
-    showToast('Loaded preset');
+    showToast('Loaded preset into calculator');
   };
 
-  // Copy share summary
   const handleCopySummary = () => {
     if (!shareCalculation || !paymentBreakdown) return;
 
     let text = `Expense Splitter: ${occasionName || 'Bill'}\n`;
     text += `Total Bill: ${formatRupee(shareCalculation.totalBill)}\n`;
     text += `Participants: ${shareCalculation.count}\n\n`;
-    text += `Individual Shares:\n`;
 
+    if (shareCalculation.hasImbalance) {
+      text += `⚠️ COST IMBALANCE FLAG (> ${imbalanceThreshold}%):\n`;
+      shareCalculation.imbalancedShares.forEach((s) => {
+        text += `• ${s.name}: ${formatRupee(s.share)} (${s.percentage.toFixed(1)}% of total)\n`;
+      });
+      text += `\n`;
+    }
+
+    text += `Individual Shares:\n`;
     shareCalculation.shares.forEach((s) => {
-      text += `• ${s.name}: ${formatRupee(s.share)} [${s.isPaid ? 'PAID' : 'PENDING'}]\n`;
+      text += `• ${s.name}: ${formatRupee(s.share)} (${s.percentage.toFixed(1)}%) [${
+        s.isPaid ? 'PAID' : 'PENDING'
+      }]\n`;
     });
 
     text += `\nPayment Status: ${shareCalculation.paidCount} of ${shareCalculation.count} paid (${formatRupee(
@@ -872,7 +1001,6 @@ export default function App() {
     setTimeout(() => setCopied(false), 2500);
   };
 
-  // UPI QR Code Generator
   const handleOpenUpiModal = async (payeeName: string, amount: number, payerName?: string) => {
     const existingUpi = upiIds[payeeName] || `${payeeName.toLowerCase().replace(/[^a-z0-9]/g, '')}@upi`;
     const note = `Dinner Share for ${occasionName || 'Bill'}`;
@@ -905,7 +1033,6 @@ export default function App() {
     }
   };
 
-  // Regenerate QR when UPI ID is updated
   const handleUpdateUpiId = async () => {
     if (!selectedUpiModal || !customUpiInput.trim()) return;
     const trimmed = customUpiInput.trim();
@@ -936,7 +1063,6 @@ export default function App() {
     }
   };
 
-  // Download QR Code
   const handleDownloadQrCode = () => {
     if (!qrCodeDataUrl || !selectedUpiModal) return;
     const a = document.createElement('a');
@@ -948,7 +1074,6 @@ export default function App() {
     showToast('Downloaded UPI QR Code');
   };
 
-  // File Exporters
   const handleDownloadJSON = () => {
     if (!shareCalculation || !paymentBreakdown) return;
     const exportData = {
@@ -959,6 +1084,8 @@ export default function App() {
       tipAmount: tipAmount,
       totalBill: shareCalculation.totalBill,
       participantsCount: shareCalculation.count,
+      imbalanceThreshold: `${imbalanceThreshold}%`,
+      imbalancesDetected: shareCalculation.imbalancedShares,
       shares: shareCalculation.shares,
       payments: paymentBreakdown.payments,
       settlements: paymentBreakdown.settlements,
@@ -974,10 +1101,14 @@ export default function App() {
 
   const handleDownloadCSV = () => {
     if (!shareCalculation || !paymentBreakdown) return;
-    let csv = `Participant,Fair Share (INR),Amount Paid (INR),Net Balance (INR),Status\n`;
+    let csv = `Participant,Fair Share (INR),Share %,Amount Paid (INR),Net Balance (INR),Imbalance Flag,Status\n`;
     paymentBreakdown.payments.forEach((p) => {
+      const shareItem = shareCalculation.shares[p.index];
       const isPaid = markedAsPaid[p.index] ? 'PAID' : 'PENDING';
-      csv += `"${p.name}",${p.share.toFixed(2)},${p.paid.toFixed(2)},${p.netBalance.toFixed(2)},${isPaid}\n`;
+      const isImb = shareItem?.isImbalanced ? `YES (> ${imbalanceThreshold}%)` : 'NO';
+      csv += `"${p.name}",${p.share.toFixed(2)},${(shareItem?.percentage || 0).toFixed(1)}%,${p.paid.toFixed(
+        2
+      )},${p.netBalance.toFixed(2)},${isImb},${isPaid}\n`;
     });
     csv += `\nTotal Bill,${shareCalculation.totalBill.toFixed(2)}\n`;
     csv += `Total Participants,${shareCalculation.count}\n`;
@@ -999,10 +1130,16 @@ export default function App() {
     receipt += `Date:           ${new Date().toLocaleString('en-IN')}\n`;
     receipt += `Total Bill:     ${formatRupee(shareCalculation.totalBill)}\n`;
     receipt += `Participants:   ${shareCalculation.count}\n`;
+    if (shareCalculation.hasImbalance) {
+      receipt += `Cost Imbalance: Flagged (> ${imbalanceThreshold}% threshold)\n`;
+    }
     receipt += `-------------------------------------------------\n`;
-    receipt += `INDIVIDUAL SHARES (Exact to the paisa):\n`;
+    receipt += `INDIVIDUAL SHARES:\n`;
     shareCalculation.shares.forEach((s) => {
-      receipt += `  ${s.name.padEnd(20)} : ${formatRupee(s.share)} [${s.isPaid ? 'PAID' : 'PENDING'}]\n`;
+      const imbTag = s.isImbalanced ? ` [⚠️ >${imbalanceThreshold}%]` : '';
+      receipt += `  ${s.name.padEnd(20)} : ${formatRupee(s.share)} (${s.percentage.toFixed(1)}%)${imbTag} [${
+        s.isPaid ? 'PAID' : 'PENDING'
+      }]\n`;
     });
     receipt += `-------------------------------------------------\n`;
     receipt += `WHAT EACH PERSON PAID:\n`;
@@ -1032,7 +1169,6 @@ export default function App() {
     setShowDownloadModal(false);
   };
 
-  // Filter history
   const filteredHistory = useMemo(() => {
     if (!historySearchQuery.trim()) return historyList;
     const q = historySearchQuery.toLowerCase();
@@ -1043,7 +1179,6 @@ export default function App() {
     );
   }, [historyList, historySearchQuery]);
 
-  // Aggregate stats
   const dashboardStats = useMemo(() => {
     const totalHistoryAmount = historyList.reduce((acc, curr) => acc + curr.totalBill, 0);
     const fullySettledCount = historyList.filter((item) => item.isFullySettled).length;
@@ -1064,12 +1199,10 @@ export default function App() {
   return (
     <div
       className={`min-h-screen font-sans antialiased relative selection:bg-emerald-500/30 ${
-        theme === 'dark'
-          ? 'bg-slate-950 text-slate-100'
-          : 'bg-slate-50 text-slate-900'
+        theme === 'dark' ? 'bg-slate-950 text-slate-100' : 'bg-slate-50 text-slate-900'
       }`}
     >
-      {/* Ambient background glows for Glassmorphism depth */}
+      {/* Ambient background glows for Glassmorphism */}
       <div className="fixed inset-0 pointer-events-none overflow-hidden z-0">
         <div
           className={`absolute -top-40 -left-40 w-96 h-96 rounded-full blur-3xl opacity-25 ${
@@ -1090,7 +1223,7 @@ export default function App() {
 
       {/* Toast Notification */}
       {toastMessage && (
-        <div className="fixed top-20 right-4 z-50 backdrop-blur-xl bg-slate-900/90 dark:bg-emerald-950/90 text-white text-xs font-semibold px-4 py-2.5 rounded-2xl shadow-xl flex items-center gap-2 border border-slate-700/50 dark:border-emerald-700/50">
+        <div className="fixed top-20 right-4 z-50 backdrop-blur-xl bg-slate-900/90 dark:bg-emerald-950/90 text-white text-xs font-semibold px-4 py-2.5 rounded-2xl shadow-xl flex items-center gap-2 border border-slate-700/50 dark:border-emerald-700/50 animate-fade-in">
           <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
           <span>{toastMessage}</span>
         </div>
@@ -1102,8 +1235,8 @@ export default function App() {
           <div
             className={`w-full max-w-sm rounded-3xl border p-6 shadow-2xl backdrop-blur-2xl transition-all ${
               theme === 'dark'
-                ? 'bg-slate-900/85 border-slate-800 text-white shadow-emerald-950/30'
-                : 'bg-white/90 border-white/60 text-slate-900 shadow-slate-200/50'
+                ? 'bg-slate-900/85 border-slate-800 text-white'
+                : 'bg-white/90 border-white/60 text-slate-900'
             }`}
           >
             <div className="flex items-center justify-between pb-3 border-b border-slate-200/50 dark:border-slate-800/80 mb-4">
@@ -1121,7 +1254,6 @@ export default function App() {
             </div>
 
             <div className="text-center space-y-3">
-              {/* Payee & Amount details */}
               <div>
                 <p className="text-xs text-slate-400 font-medium">
                   {selectedUpiModal.payerName ? (
@@ -1143,7 +1275,6 @@ export default function App() {
                 </div>
               </div>
 
-              {/* QR Code Container with sleek frosted border */}
               <div className="p-3 bg-white rounded-2xl shadow-inner border border-slate-200/60 inline-block">
                 {qrCodeDataUrl ? (
                   <img
@@ -1158,7 +1289,6 @@ export default function App() {
                 )}
               </div>
 
-              {/* Payee UPI ID with edit capability */}
               <div className="px-3 py-2 rounded-xl bg-slate-100/70 dark:bg-slate-800/60 border border-slate-200/50 dark:border-slate-700/50 text-xs">
                 {isEditingUpiId ? (
                   <div className="flex items-center gap-1.5">
@@ -1197,11 +1327,6 @@ export default function App() {
                 )}
               </div>
 
-              <p className="text-[11px] text-slate-400">
-                Scan with Google Pay, PhonePe, Paytm, or BHIM UPI
-              </p>
-
-              {/* Actions: Download QR + Open UPI App */}
               <div className="flex items-center gap-2 pt-2">
                 <button
                   type="button"
@@ -1233,7 +1358,7 @@ export default function App() {
         </div>
       )}
 
-      {/* MODAL: Server & Hosting Links */}
+      {/* MODAL: Server Links */}
       {showServerModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-md animate-fade-in">
           <div
@@ -1447,7 +1572,6 @@ export default function App() {
         }`}
       >
         <div className="max-w-6xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between relative z-10">
-          {/* Logo & Brand */}
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 rounded-2xl bg-gradient-to-tr from-emerald-600 to-teal-500 text-white flex items-center justify-center shadow-md shadow-emerald-500/20">
               <Split className="w-5 h-5" />
@@ -1471,7 +1595,177 @@ export default function App() {
           </div>
 
           {/* Action Bar */}
-          <div className="flex items-center gap-2 sm:gap-2.5">
+          <div className="flex items-center gap-2 sm:gap-2.5 relative">
+            {/* IN-APP NOTIFICATION BELL WITH ACTIVE BADGE */}
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => setShowNotificationsMenu((prev) => !prev)}
+                title="In-app Notifications & Cost Imbalance Alerts"
+                className={`p-2 rounded-xl border backdrop-blur-md transition-all relative cursor-pointer ${
+                  unreadCount > 0
+                    ? 'border-amber-500/50 bg-amber-500/10 text-amber-500 hover:bg-amber-500/20'
+                    : theme === 'dark'
+                    ? 'border-slate-800 bg-slate-800/50 text-slate-300 hover:text-white'
+                    : 'border-slate-200/80 bg-white/60 text-slate-700 hover:bg-white'
+                }`}
+              >
+                {unreadCount > 0 ? (
+                  <BellRing className="w-4 h-4 text-amber-500 animate-pulse" />
+                ) : (
+                  <Bell className="w-4 h-4" />
+                )}
+                {unreadCount > 0 && (
+                  <span className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-amber-500 text-slate-950 font-bold text-[10px] flex items-center justify-center shadow-xs">
+                    {unreadCount}
+                  </span>
+                )}
+              </button>
+
+              {/* IN-APP NOTIFICATION DROPDOWN CENTER */}
+              {showNotificationsMenu && (
+                <div
+                  className={`absolute right-0 top-12 w-80 sm:w-96 rounded-3xl border p-4 shadow-2xl backdrop-blur-2xl z-50 animate-fade-in transition-all ${
+                    theme === 'dark'
+                      ? 'bg-slate-900/95 border-slate-800 text-white shadow-black/40'
+                      : 'bg-white/95 border-white/80 text-slate-900 shadow-slate-300/40'
+                  }`}
+                >
+                  <div className="flex items-center justify-between pb-3 border-b border-slate-200/50 dark:border-slate-800/80 mb-3">
+                    <div className="flex items-center gap-2">
+                      <ShieldAlert className="w-4 h-4 text-amber-500" />
+                      <h4 className="font-bold text-xs uppercase tracking-wider">
+                        Cost Imbalance Center
+                      </h4>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      {unreadCount > 0 && (
+                        <button
+                          type="button"
+                          onClick={clearAllNotifications}
+                          className="text-[11px] font-semibold text-slate-400 hover:text-rose-500 cursor-pointer mr-1"
+                        >
+                          Clear
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => setShowNotificationsMenu(false)}
+                        className="text-xs text-slate-400 hover:text-slate-200 cursor-pointer"
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Sensitivity Threshold Selector */}
+                  <div className="p-3 rounded-2xl bg-slate-100/60 dark:bg-slate-800/50 border border-slate-200/50 dark:border-slate-700/50 mb-3 text-xs">
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-[11px] font-medium text-slate-400 flex items-center gap-1.5">
+                        <SlidersHorizontal className="w-3.5 h-3.5 text-emerald-500" />
+                        Imbalance alert threshold:
+                      </span>
+                      <span className="font-mono font-bold text-emerald-600 dark:text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded-md">
+                        {imbalanceThreshold}% of bill
+                      </span>
+                    </div>
+
+                    {/* Interactive Range Slider */}
+                    <div className="space-y-1 mb-2.5">
+                      <input
+                        type="range"
+                        min="20"
+                        max="80"
+                        step="5"
+                        value={imbalanceThreshold}
+                        onChange={(e) => setImbalanceThreshold(Number(e.target.value))}
+                        className="w-full accent-emerald-500 h-1.5 bg-slate-200 dark:bg-slate-700 rounded-lg cursor-pointer"
+                      />
+                      <div className="flex justify-between text-[9px] text-slate-400 font-mono px-0.5">
+                        <span>20%</span>
+                        <span>50% (Default)</span>
+                        <span>80%</span>
+                      </div>
+                    </div>
+
+                    {/* Quick Presets */}
+                    <div className="grid grid-cols-4 gap-1">
+                      {[35, 40, 50, 60].map((th) => (
+                        <button
+                          key={th}
+                          type="button"
+                          onClick={() => setImbalanceThreshold(th)}
+                          className={`py-1 text-[11px] font-semibold rounded-lg border transition cursor-pointer ${
+                            imbalanceThreshold === th
+                              ? 'bg-emerald-600 text-white border-emerald-600 shadow-xs'
+                              : 'bg-white/70 dark:bg-slate-700/50 text-slate-700 dark:text-slate-300 border-slate-200/60 dark:border-slate-600/60 hover:border-emerald-500/50'
+                          }`}
+                        >
+                          {th}%
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Active Notifications List */}
+                  {activeNotifications.length > 0 ? (
+                    <div className="space-y-2.5 max-h-72 overflow-y-auto pr-1">
+                      {activeNotifications.map((n) => (
+                        <div
+                          key={n.id}
+                          className="p-3 rounded-2xl border border-amber-500/30 bg-amber-500/10 dark:bg-amber-950/20 text-xs space-y-1.5"
+                        >
+                          <div className="flex items-center justify-between">
+                            <span className="font-bold text-amber-700 dark:text-amber-400 flex items-center gap-1.5">
+                              <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                              {n.title}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => dismissNotification(n.id)}
+                              className="text-slate-400 hover:text-slate-200 cursor-pointer p-0.5"
+                              title="Dismiss"
+                            >
+                              <X className="w-3 h-3" />
+                            </button>
+                          </div>
+                          <p className="text-[11px] text-slate-600 dark:text-slate-300 leading-relaxed">
+                            {n.message}
+                          </p>
+                          <div className="flex items-center justify-between text-[10px] text-slate-400 pt-1 border-t border-amber-500/20">
+                            <span>Share: <strong>{n.percentage.toFixed(1)}%</strong></span>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setShowNotificationsMenu(false);
+                                setActiveTab('splitter');
+                                if (resultsRef.current) {
+                                  resultsRef.current.scrollIntoView({ behavior: 'smooth' });
+                                }
+                              }}
+                              className="text-emerald-500 font-bold hover:underline cursor-pointer"
+                            >
+                              Inspect in Splitter →
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="py-6 text-center text-xs text-slate-400">
+                      <CheckCircle2 className="w-8 h-8 text-emerald-500 mx-auto mb-2 opacity-80" />
+                      <p className="font-semibold text-slate-700 dark:text-slate-200">
+                        No Cost Imbalances
+                      </p>
+                      <p className="text-[11px] mt-0.5">
+                        No participant&apos;s share exceeds {imbalanceThreshold}% of the total bill.
+                      </p>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
             <button
               type="button"
               onClick={() => setShowServerModal(true)}
@@ -1486,7 +1780,6 @@ export default function App() {
               <span className="hidden md:inline">Server</span>
             </button>
 
-            {/* Google Authentication Button / User Chip */}
             {currentUser ? (
               <div
                 className={`flex items-center gap-2 pl-2 pr-1.5 py-1 rounded-2xl border backdrop-blur-md text-xs font-medium ${
@@ -1531,7 +1824,6 @@ export default function App() {
               </button>
             )}
 
-            {/* Recalculate / Refresh */}
             <button
               type="button"
               onClick={handleRefreshData}
@@ -1545,7 +1837,6 @@ export default function App() {
               <RefreshCw className="w-4 h-4 text-emerald-500" />
             </button>
 
-            {/* Dark/Light Mode Switch */}
             <button
               type="button"
               onClick={toggleTheme}
@@ -1559,7 +1850,6 @@ export default function App() {
               {theme === 'dark' ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
             </button>
 
-            {/* Clear All */}
             <button
               type="button"
               onClick={handleClearAll}
@@ -1595,7 +1885,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => setActiveTab('splitter')}
-                className={`px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-2 transition cursor-pointer shrink-0 ${
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-2 transition cursor-pointer shrink-0 relative ${
                   activeTab === 'splitter'
                     ? 'bg-emerald-600 text-white shadow-xs'
                     : 'text-slate-400 hover:text-slate-800 dark:hover:text-white'
@@ -1603,6 +1893,9 @@ export default function App() {
               >
                 <Split className="w-3.5 h-3.5" />
                 <span>Splitter</span>
+                {shareCalculation?.hasImbalance && (
+                  <span className="w-2 h-2 rounded-full bg-amber-400" />
+                )}
                 {!isInvalid && shareCalculation && (
                   <span className="text-[10px] px-1.5 py-0.2 rounded-full font-mono bg-white/20 text-white">
                     {formatRupee(shareCalculation.totalBill)}
@@ -1627,7 +1920,6 @@ export default function App() {
               </button>
             </nav>
 
-            {/* Presets */}
             <div className="hidden md:flex items-center gap-1.5 pl-2 text-xs">
               <span className="font-medium text-slate-400">Presets:</span>
               <button
@@ -1639,10 +1931,11 @@ export default function App() {
               </button>
               <button
                 type="button"
-                onClick={() => handleLoadSample('pizza')}
-                className="px-2.5 py-1 rounded-lg text-xs font-medium bg-slate-200/50 dark:bg-slate-800/50 hover:bg-emerald-500/10 hover:text-emerald-500 transition cursor-pointer"
+                onClick={() => handleLoadSample('imbalanced_dinner')}
+                title="Test with an imbalanced share (>50%)"
+                className="px-2.5 py-1 rounded-lg text-xs font-semibold bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20 hover:bg-amber-500/20 transition cursor-pointer"
               >
-                Pizza 3x
+                Imbalance Demo (&gt;50%)
               </button>
             </div>
           </div>
@@ -1657,7 +1950,6 @@ export default function App() {
         {/* ============================================================== */}
         {activeTab === 'dashboard' && (
           <div className="space-y-6 animate-fade-in">
-            {/* Glassmorphic Overview Card */}
             <div
               className={`rounded-3xl border p-6 sm:p-8 backdrop-blur-xl shadow-lg transition-all ${
                 theme === 'dark'
@@ -1667,15 +1959,23 @@ export default function App() {
             >
               <div className="flex flex-col md:flex-row md:items-center justify-between gap-6">
                 <div>
-                  <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 text-xs font-bold mb-3">
-                    <TrendingUp className="w-3.5 h-3.5" />
-                    Dining & Bill Management
-                  </span>
+                  <div className="flex items-center gap-2 mb-3">
+                    <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 text-xs font-bold">
+                      <TrendingUp className="w-3.5 h-3.5" />
+                      Dining & Bill Management
+                    </span>
+                    {shareCalculation?.hasImbalance && (
+                      <span className="inline-flex items-center gap-1 px-3 py-1 rounded-full bg-amber-500/10 text-amber-600 dark:text-amber-400 text-xs font-bold border border-amber-500/30">
+                        <AlertTriangle className="w-3 h-3" />
+                        Imbalance Flagged (&gt;{imbalanceThreshold}%)
+                      </span>
+                    )}
+                  </div>
                   <h2 className="text-2xl sm:text-3xl font-extrabold tracking-tight">
                     Expense Split Command Center
                   </h2>
                   <p className="text-xs sm:text-sm text-slate-400 max-w-xl mt-1 leading-relaxed">
-                    Instant UPI settlements, zero-paise discrepancy distribution, and cross-device sync.
+                    Automated cost imbalance auditing, instant UPI QR settlements, and exact Rupee precision.
                   </p>
                 </div>
 
@@ -1764,28 +2064,40 @@ export default function App() {
               </div>
 
               <div
-                className={`p-5 rounded-3xl border backdrop-blur-xl transition-all ${
-                  theme === 'dark'
-                    ? 'bg-slate-900/60 border-slate-800/80'
-                    : 'bg-white/70 border-white/60 shadow-xs'
+                onClick={() => {
+                  if (shareCalculation?.hasImbalance) {
+                    setShowNotificationsMenu(true);
+                  }
+                  setActiveTab('splitter');
+                  if (resultsRef.current) {
+                    resultsRef.current.scrollIntoView({ behavior: 'smooth' });
+                  }
+                }}
+                className={`p-5 rounded-3xl border backdrop-blur-xl transition-all cursor-pointer ${
+                  shareCalculation?.hasImbalance
+                    ? 'border-amber-500/50 bg-amber-500/10 hover:border-amber-500 hover:bg-amber-500/15'
+                    : theme === 'dark'
+                    ? 'bg-slate-900/60 border-slate-800/80 hover:border-slate-700'
+                    : 'bg-white/70 border-white/60 shadow-xs hover:border-slate-300'
                 }`}
+                title="Click to inspect Cost Imbalance in Splitter"
               >
                 <div className="flex items-center justify-between text-xs text-slate-400 font-semibold mb-2">
-                  <span>Lifetime Tracked</span>
-                  <CircleDollarSign className="w-4 h-4 text-emerald-500" />
+                  <span>Cost Imbalances</span>
+                  <AlertTriangle className={`w-4 h-4 ${shareCalculation?.hasImbalance ? 'text-amber-500 animate-pulse' : 'text-slate-400'}`} />
                 </div>
-                <div className="text-2xl font-extrabold font-mono text-emerald-500">
-                  {formatRupee(dashboardStats.totalHistoryAmount)}
+                <div className={`text-2xl font-extrabold font-mono ${shareCalculation?.hasImbalance ? 'text-amber-500' : 'text-emerald-500'}`}>
+                  {shareCalculation?.imbalancedShares.length || 0}
                 </div>
-                <p className="text-xs text-slate-400 mt-1">
-                  Across all occasions
+                <p className="text-xs text-slate-400 mt-1 flex items-center justify-between">
+                  <span>Threshold: {imbalanceThreshold}%</span>
+                  <span className="text-emerald-500 font-semibold text-[11px]">Inspect →</span>
                 </p>
               </div>
             </div>
 
             {/* Quick Widgets */}
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-              {/* Active Bill Preview */}
               <div
                 className={`lg:col-span-6 p-6 rounded-3xl border backdrop-blur-xl transition-all ${
                   theme === 'dark'
@@ -1951,7 +2263,7 @@ export default function App() {
         )}
 
         {/* ============================================================== */}
-        {/* VIEW 2: SPLITTER (Precision Calculator & UPI QR Codes)         */}
+        {/* VIEW 2: SPLITTER (Precision Calculator & Imbalance System)     */}
         {/* ============================================================== */}
         {activeTab === 'splitter' && (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 lg:gap-8 items-start animate-fade-in">
@@ -2042,7 +2354,7 @@ export default function App() {
                     )}
                   </div>
 
-                  {/* Tip / Surcharge */}
+                  {/* Tip */}
                   <div className="pt-1">
                     <div className="flex items-center justify-between mb-1.5">
                       <span className="text-xs font-bold uppercase tracking-wider text-slate-400">
@@ -2077,7 +2389,7 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* Participants */}
+                  {/* Participants Stepper */}
                   <div className="pt-2">
                     <div className="flex items-center justify-between mb-1.5">
                       <label
@@ -2150,7 +2462,6 @@ export default function App() {
                       </p>
                     )}
 
-                    {/* Quick Stepper Chips */}
                     <div className="flex items-center gap-1.5 mt-2.5">
                       <span className="text-xs text-slate-400">Quick:</span>
                       {[2, 3, 4, 5, 6, 8].map((num) => (
@@ -2170,6 +2481,93 @@ export default function App() {
                         </button>
                       ))}
                     </div>
+                  </div>
+
+                  {/* SPLIT ALLOCATION MODE: Equal vs Custom (Allows unequal itemized shares) */}
+                  <div className="pt-2 border-t border-slate-200/60 dark:border-slate-800/80">
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-xs font-bold uppercase tracking-wider text-slate-400">
+                        Share Allocation:
+                      </span>
+                      <div className="flex items-center gap-1">
+                        <button
+                          type="button"
+                          onClick={() => setSplitMode('equal')}
+                          className={`text-[11px] px-2.5 py-1 rounded-lg font-semibold transition cursor-pointer ${
+                            splitMode === 'equal'
+                              ? 'bg-emerald-600 text-white'
+                              : 'text-slate-400 hover:text-slate-200'
+                          }`}
+                        >
+                          Equal Split
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setSplitMode('custom');
+                            if (Object.keys(customShareInputs).length === 0 && shareCalculation) {
+                              const init: Record<number, string> = {};
+                              shareCalculation.shares.forEach((s) => {
+                                init[s.index] = s.share.toFixed(2);
+                              });
+                              setCustomShareInputs(init);
+                            }
+                          }}
+                          className={`text-[11px] px-2.5 py-1 rounded-lg font-semibold transition cursor-pointer ${
+                            splitMode === 'custom'
+                              ? 'bg-emerald-600 text-white'
+                              : 'text-slate-400 hover:text-slate-200'
+                          }`}
+                        >
+                          Custom Itemized
+                        </button>
+                      </div>
+                    </div>
+
+                    {splitMode === 'custom' && (
+                      <div className="space-y-2 p-3 rounded-2xl bg-slate-100/60 dark:bg-slate-800/40 border border-slate-200/60 dark:border-slate-700/60">
+                        <div className="flex items-center justify-between text-[11px]">
+                          <span className="text-slate-400">Specify each person&apos;s share:</span>
+                          <button
+                            type="button"
+                            onClick={handleAutoBalanceRemaining}
+                            className="text-emerald-500 font-semibold hover:underline cursor-pointer"
+                          >
+                            Auto-balance
+                          </button>
+                        </div>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                          {Array.from({ length: Math.min(rawCount || 0, 12) }).map((_, idx) => (
+                            <div
+                              key={idx}
+                              className="flex items-center justify-between gap-1.5 px-2.5 py-1.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-white/80 dark:bg-slate-900/80 text-xs"
+                            >
+                              <span className="truncate max-w-[80px] font-medium text-slate-700 dark:text-slate-300">
+                                {participantNames[idx] || `Person ${idx + 1}`}
+                              </span>
+                              <div className="relative w-24">
+                                <span className="absolute inset-y-0 left-0 pl-1.5 flex items-center text-xs text-slate-400">
+                                  ₹
+                                </span>
+                                <input
+                                  type="number"
+                                  step="0.01"
+                                  placeholder="0.00"
+                                  value={customShareInputs[idx] ?? ''}
+                                  onChange={(e) =>
+                                    setCustomShareInputs((prev) => ({
+                                      ...prev,
+                                      [idx]: e.target.value,
+                                    }))
+                                  }
+                                  className="w-full pl-4 pr-1 py-0.5 text-xs text-right font-mono font-semibold rounded focus:outline-none"
+                                />
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                   </div>
 
                   {/* Names customization */}
@@ -2244,6 +2642,48 @@ export default function App() {
               ) : (
                 shareCalculation && (
                   <>
+                    {/* IN-APP NOTIFICATION BANNER: Prominently flags when any share exceeds the threshold */}
+                    {shareCalculation.hasImbalance && (
+                      <div className="rounded-3xl border border-amber-500/40 bg-amber-500/10 dark:bg-amber-950/25 backdrop-blur-xl p-4 sm:p-5 shadow-lg shadow-amber-500/5 animate-fade-in">
+                        <div className="flex items-start gap-3">
+                          <div className="p-2.5 rounded-2xl bg-amber-500 text-slate-950 shrink-0 mt-0.5">
+                            <AlertTriangle className="w-5 h-5" />
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center justify-between gap-2 mb-1">
+                              <h4 className="font-extrabold text-sm tracking-tight text-amber-700 dark:text-amber-300 flex items-center gap-1.5">
+                                <span>Cost Imbalance Flagged</span>
+                                <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-700 dark:text-amber-300 font-mono">
+                                  &gt; {imbalanceThreshold}% Threshold
+                                </span>
+                              </h4>
+                              <button
+                                type="button"
+                                onClick={() => setShowNotificationsMenu(true)}
+                                className="text-xs font-semibold text-amber-600 dark:text-amber-400 hover:underline cursor-pointer"
+                              >
+                                View Alerts ({unreadCount})
+                              </button>
+                            </div>
+
+                            <p className="text-xs text-slate-700 dark:text-slate-300 leading-relaxed">
+                              {shareCalculation.imbalancedShares.map((s, idx) => (
+                                <span key={s.index}>
+                                  <strong>{s.name}</strong> is paying <strong>{formatRupee(s.share)}</strong> (
+                                  <span className="font-mono font-bold text-amber-600 dark:text-amber-400">
+                                    {s.percentage.toFixed(1)}%
+                                  </span>{' '}
+                                  of the bill)
+                                  {idx < shareCalculation.imbalancedShares.length - 1 ? ', ' : '.'}
+                                </span>
+                              ))}{' '}
+                              This concentration exceeds the configured {imbalanceThreshold}% limit. Review to ensure this split was intentional.
+                            </p>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
                     {/* Real Split Card */}
                     <div
                       className={`rounded-3xl border p-5 sm:p-6 backdrop-blur-xl shadow-lg transition-all ${
@@ -2351,42 +2791,28 @@ export default function App() {
                         </div>
                       </div>
 
-                      {/* Exact Rupee Guarantee */}
-                      <div
-                        className={`mt-4 p-4 rounded-2xl border ${
-                          theme === 'dark'
-                            ? 'bg-slate-800/30 border-slate-800/60'
-                            : 'bg-white/60 border-slate-200/60'
-                        }`}
-                      >
-                        <div className="flex flex-col sm:flex-row sm:items-center justify-between text-xs font-medium mb-1.5 gap-1">
-                          <span className="flex items-center gap-1.5">
-                            <CheckCircle2 className="w-4 h-4 text-emerald-500 shrink-0" />
-                            <strong>Exact Paisa Balancing:</strong>
-                          </span>
-                          <span className="font-mono font-bold text-emerald-500 text-sm">
-                            Sum of shares = {formatRupee(shareCalculation.calculatedSum)}
+                      {/* Participant Shares Grid with In-App Imbalance Badges */}
+                      <div className="mt-5">
+                        <div className="flex items-center justify-between mb-3">
+                          <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400">
+                            Individual Shares & Instant UPI Settlement
+                          </h4>
+                          <span className="text-[11px] font-mono text-slate-400">
+                            Alert threshold: &gt;{imbalanceThreshold}%
                           </span>
                         </div>
-                        <p className="text-xs text-slate-400 leading-relaxed">
-                          Total bill of <span className="font-semibold text-emerald-500">{formatRupee(shareCalculation.totalBill)}</span> is balanced across {shareCalculation.count} participants with zero penny difference.
-                        </p>
-                      </div>
-
-                      {/* Participant Shares Grid with UPI QR Buttons */}
-                      <div className="mt-5">
-                        <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400 mb-3">
-                          Individual Shares & Instant UPI Settlement
-                        </h4>
 
                         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                           {shareCalculation.shares.map((person) => {
                             const isPaid = person.isPaid;
+                            const isImbalanced = person.isImbalanced;
                             return (
                               <div
                                 key={person.index}
-                                className={`p-4 rounded-2xl border transition-all flex flex-col justify-between gap-3 ${
-                                  isPaid
+                                className={`p-4 rounded-2xl border transition-all flex flex-col justify-between gap-3 relative overflow-hidden ${
+                                  isImbalanced
+                                    ? 'border-amber-500/60 bg-amber-500/5 dark:bg-amber-950/20 shadow-md shadow-amber-500/5'
+                                    : isPaid
                                     ? theme === 'dark'
                                       ? 'bg-emerald-950/20 border-emerald-800/40'
                                       : 'bg-emerald-50/70 border-emerald-200/80'
@@ -2395,12 +2821,21 @@ export default function App() {
                                     : 'bg-white/80 border-slate-200/80 hover:border-slate-300'
                                 }`}
                               >
-                                <div className="flex items-center justify-between">
+                                {isImbalanced && (
+                                  <div className="absolute top-0 right-0 bg-amber-500 text-slate-950 font-extrabold text-[9px] px-2.5 py-0.5 rounded-bl-xl uppercase tracking-wider flex items-center gap-1 shadow-xs">
+                                    <AlertTriangle className="w-2.5 h-2.5" />
+                                    <span>Imbalance ({person.percentage.toFixed(1)}%)</span>
+                                  </div>
+                                )}
+
+                                <div className="flex items-center justify-between pt-1">
                                   <div className="flex items-center gap-2.5 min-w-0">
                                     <div
                                       className={`w-9 h-9 rounded-xl text-xs font-bold flex items-center justify-center shrink-0 ${
                                         isPaid
                                           ? 'bg-emerald-500 text-slate-950'
+                                          : isImbalanced
+                                          ? 'bg-amber-500 text-slate-950'
                                           : 'bg-slate-900 dark:bg-slate-700 text-white'
                                       }`}
                                     >
@@ -2417,7 +2852,10 @@ export default function App() {
                                         {person.name}
                                       </p>
                                       <p className="text-[11px] text-slate-400">
-                                        {person.getsExtraPaise ? '+₹0.01 rounded' : 'Equal share'}
+                                        <span className="font-semibold text-slate-600 dark:text-slate-300">
+                                          {person.percentage.toFixed(1)}%
+                                        </span>{' '}
+                                        of bill
                                       </p>
                                     </div>
                                   </div>
@@ -2455,7 +2893,6 @@ export default function App() {
                                     )}
                                   </button>
 
-                                  {/* UPI QR Code Generator Button */}
                                   <button
                                     type="button"
                                     onClick={() => handleOpenUpiModal(person.name, person.share)}
@@ -2508,7 +2945,6 @@ export default function App() {
 
                       {showPaidBreakdown && paymentBreakdown && (
                         <div className="mt-5 pt-5 border-t border-slate-200/60 dark:border-slate-800/80 space-y-5">
-                          {/* Payer Configuration */}
                           <div
                             className={`rounded-2xl p-4 border ${
                               theme === 'dark'
@@ -2699,7 +3135,6 @@ export default function App() {
                                         {formatRupee(settle.amount)}
                                       </span>
 
-                                      {/* One-click UPI QR Code for this exact transfer */}
                                       <button
                                         type="button"
                                         onClick={() =>
@@ -2832,7 +3267,6 @@ export default function App() {
                       </div>
                     </div>
 
-                    {/* Shares */}
                     <div className="mt-4">
                       <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
                         {item.shares.map((s, idx) => (
