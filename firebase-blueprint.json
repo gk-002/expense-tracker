@@ -1,0 +1,83 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "User profile document for authenticated users",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "email": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "displayName": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "photoURL": {
+          "type": "string",
+          "maxLength": 512
+        },
+        "createdAt": {
+          "type": "string"
+        }
+      },
+      "required": ["id", "email"]
+    },
+    "Split": {
+      "title": "Split",
+      "description": "An expense split record for an occasion",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "occasion": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "date": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "timestamp": {
+          "type": "number"
+        },
+        "totalBill": {
+          "type": "number"
+        },
+        "participantsCount": {
+          "type": "number"
+        },
+        "isFullySettled": {
+          "type": "boolean"
+        },
+        "shares": {
+          "type": "array"
+        },
+        "settlements": {
+          "type": "array"
+        }
+      },
+      "required": ["id", "ownerId", "occasion", "totalBill", "participantsCount"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "Stores user profile"
+    },
+    "/users/{userId}/splits/{splitId}": {
+      "schema": "Split",
+      "description": "Stores saved dinner splits for the user"
+    }
+  }
+}

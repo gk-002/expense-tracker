@@ -1,0 +1,53 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default-deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidUserProfile(data) {
+      return data.id is string && data.id.size() <= 128 &&
+             data.email is string && data.email.size() <= 256;
+    }
+
+    function isValidSplit(data) {
+      return data.id is string && data.id.size() <= 128 &&
+             data.ownerId is string && data.ownerId == request.auth.uid &&
+             data.occasion is string && data.occasion.size() <= 128 &&
+             data.totalBill is number && data.totalBill >= 0 &&
+             data.participantsCount is number && data.participantsCount > 0;
+    }
+
+    // User Profile
+    match /users/{userId} {
+      allow get: if isSignedIn() && request.auth.uid == userId;
+      allow create, update: if isSignedIn() && request.auth.uid == userId && isValidId(userId) && isValidUserProfile(incoming());
+      allow delete: if false;
+
+      // User's private expense splits
+      match /splits/{splitId} {
+        allow get, list: if isSignedIn() && request.auth.uid == userId;
+        allow create: if isSignedIn() && request.auth.uid == userId && isValidId(splitId) && isValidSplit(incoming());
+        allow update: if isSignedIn() && request.auth.uid == userId && isValidId(splitId) && isValidSplit(incoming()) && incoming().ownerId == existing().ownerId;
+        allow delete: if isSignedIn() && request.auth.uid == userId && isValidId(splitId);
+      }
+    }
+  }
+}

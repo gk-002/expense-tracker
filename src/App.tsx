@@ -6,13 +6,11 @@ import {
   CheckCircle2,
   Copy,
   Check,
-  Sparkles,
   CreditCard,
   ChevronDown,
   ChevronUp,
   Split,
   Utensils,
-  ArrowDown,
   Sun,
   Moon,
   Trash2,
@@ -22,19 +20,41 @@ import {
   LayoutDashboard,
   History as HistoryIcon,
   RefreshCw,
-  Plus,
   Calendar,
   BookmarkCheck,
   Search,
   ArrowRight,
   TrendingUp,
-  ShieldCheck
+  Download,
+  FileText,
+  FileSpreadsheet,
+  FileCode,
+  LogIn,
+  LogOut,
+  QrCode,
+  ExternalLink,
+  Laptop,
+  CloudCheck,
+  Edit3
 } from 'lucide-react';
+import QRCode from 'qrcode';
+import {
+  auth,
+  db,
+  signInWithGoogle,
+  logOut,
+  testConnection,
+  handleFirestoreError,
+  OperationType,
+} from './firebase';
+import { onAuthStateChanged, User as FirebaseUser } from 'firebase/auth';
+import { collection, doc, setDoc, deleteDoc, onSnapshot } from 'firebase/firestore';
 
 // Storage keys
-const ACTIVE_STORAGE_KEY = 'expense_splitter_active_data_v3';
-const HISTORY_STORAGE_KEY = 'expense_splitter_history_v3';
-const THEME_STORAGE_KEY = 'expense_splitter_theme_v3';
+const ACTIVE_STORAGE_KEY = 'expense_splitter_active_data_v5';
+const HISTORY_STORAGE_KEY = 'expense_splitter_history_v5';
+const THEME_STORAGE_KEY = 'expense_splitter_theme_v5';
+const UPI_STORAGE_KEY = 'expense_splitter_upi_ids_v5';
 
 export interface HistoryItem {
   id: string;
@@ -46,6 +66,7 @@ export interface HistoryItem {
   shares: { name: string; share: number; isPaid: boolean }[];
   settlements: { from: string; to: string; amount: number; isSettled: boolean }[];
   isFullySettled: boolean;
+  ownerId?: string;
 }
 
 // Safely load active bill from localStorage
@@ -59,7 +80,7 @@ function getStoredActiveData() {
       }
     }
   } catch (e) {
-    console.error('Failed to load active bill from storage:', e);
+    console.error('Failed to load active bill:', e);
   }
   return null;
 }
@@ -75,9 +96,8 @@ function getStoredHistory(): HistoryItem[] {
       }
     }
   } catch (e) {
-    console.error('Failed to load history from storage:', e);
+    console.error('Failed to load history:', e);
   }
-  // Default sample history items so dashboard has rich initial data
   return [
     {
       id: 'hist-1',
@@ -120,9 +140,70 @@ function getStoredHistory(): HistoryItem[] {
   ];
 }
 
+// Safely load UPI IDs from localStorage
+function getStoredUpiIds(): Record<string, string> {
+  try {
+    const raw = localStorage.getItem(UPI_STORAGE_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch {
+    // fallback
+  }
+  return {
+    Rahul: 'rahul@okaxis',
+    Priya: 'priya@upi',
+    Amit: 'amit@paytm',
+    Sneha: 'sneha@ybl',
+  };
+}
+
+// Download helper function
+function downloadFile(content: string, filename: string, mimeType: string) {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
 export default function App() {
   // Navigation tabs: 'dashboard' | 'splitter' | 'history'
   const [activeTab, setActiveTab] = useState<'dashboard' | 'splitter' | 'history'>('splitter');
+
+  // Firebase Auth State
+  const [currentUser, setCurrentUser] = useState<FirebaseUser | null>(null);
+  const [authLoading, setAuthLoading] = useState<boolean>(true);
+
+  // Modals state
+  const [showServerModal, setShowServerModal] = useState<boolean>(false);
+  const [showDownloadModal, setShowDownloadModal] = useState<boolean>(false);
+
+  // UPI QR Code Modal State
+  const [selectedUpiModal, setSelectedUpiModal] = useState<{
+    payeeName: string;
+    payerName?: string;
+    amount: number;
+    upiId: string;
+    note: string;
+  } | null>(null);
+  const [qrCodeDataUrl, setQrCodeDataUrl] = useState<string>('');
+  const [isEditingUpiId, setIsEditingUpiId] = useState<boolean>(false);
+  const [customUpiInput, setCustomUpiInput] = useState<string>('');
+
+  // UPI IDs mapped by participant name
+  const [upiIds, setUpiIds] = useState<Record<string, string>>(() => getStoredUpiIds());
+
+  // Save UPI IDs to localStorage
+  useEffect(() => {
+    try {
+      localStorage.setItem(UPI_STORAGE_KEY, JSON.stringify(upiIds));
+    } catch {
+      // ignore
+    }
+  }, [upiIds]);
 
   // Theme state: dark / light mode
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
@@ -157,10 +238,44 @@ export default function App() {
     setTheme((prev) => (prev === 'light' ? 'dark' : 'light'));
   };
 
+  // Test Firestore connection on boot
+  useEffect(() => {
+    testConnection();
+  }, []);
+
+  // Listen to Firebase Auth state
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      setCurrentUser(user);
+      setAuthLoading(false);
+
+      if (user) {
+        const userRef = doc(db, 'users', user.uid);
+        try {
+          await setDoc(
+            userRef,
+            {
+              id: user.uid,
+              email: user.email || '',
+              displayName: user.displayName || 'User',
+              photoURL: user.photoURL || '',
+              createdAt: new Date().toISOString(),
+            },
+            { merge: true }
+          );
+        } catch (err) {
+          console.warn('Could not sync user profile to Firestore:', err);
+        }
+      }
+    });
+
+    return () => unsubscribe();
+  }, []);
+
   // Load initial stored active state synchronously (IMMUNE TO PAGE RELOAD)
   const initialActive = useMemo(() => getStoredActiveData(), []);
 
-  // Core input states initialized from stored data
+  // Core input states
   const [occasionName, setOccasionName] = useState<string>(
     () => initialActive?.occasionName ?? 'Dinner with Friends'
   );
@@ -177,7 +292,7 @@ export default function App() {
     () => initialActive?.customTipInput ?? ''
   );
 
-  // Primary payer selection or custom payments mode
+  // Payer selection or custom payments mode
   const [payerMode, setPayerMode] = useState<'single' | 'custom'>(
     () => initialActive?.payerMode ?? 'single'
   );
@@ -188,7 +303,7 @@ export default function App() {
     () => initialActive?.customPaidAmounts ?? {}
   );
 
-  // Participant custom names
+  // Participant names
   const [participantNames, setParticipantNames] = useState<Record<number, string>>(
     () =>
       initialActive?.participantNames ?? {
@@ -218,7 +333,47 @@ export default function App() {
   const [historyList, setHistoryList] = useState<HistoryItem[]>(() => getStoredHistory());
   const [historySearchQuery, setHistorySearchQuery] = useState<string>('');
 
-  // UI state for notifications
+  // Real-time Firestore sync for Split History when authenticated
+  useEffect(() => {
+    if (!currentUser) return;
+
+    const path = `users/${currentUser.uid}/splits`;
+    const splitsCol = collection(db, 'users', currentUser.uid, 'splits');
+
+    const unsubscribe = onSnapshot(
+      splitsCol,
+      (snapshot) => {
+        const firestoreSplits: HistoryItem[] = [];
+        snapshot.forEach((docSnap) => {
+          const data = docSnap.data();
+          firestoreSplits.push({
+            id: docSnap.id,
+            occasion: data.occasion || 'Dinner Split',
+            date: data.date || '',
+            timestamp: data.timestamp || Date.now(),
+            totalBill: data.totalBill || 0,
+            participantsCount: data.participantsCount || 1,
+            shares: data.shares || [],
+            settlements: data.settlements || [],
+            isFullySettled: !!data.isFullySettled,
+            ownerId: data.ownerId,
+          });
+        });
+
+        if (firestoreSplits.length > 0) {
+          firestoreSplits.sort((a, b) => b.timestamp - a.timestamp);
+          setHistoryList(firestoreSplits);
+        }
+      },
+      (error) => {
+        handleFirestoreError(error, OperationType.GET, path);
+      }
+    );
+
+    return () => unsubscribe();
+  }, [currentUser]);
+
+  // Toast notification
   const [copied, setCopied] = useState<boolean>(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
@@ -230,8 +385,7 @@ export default function App() {
   // Ref to results section for smooth scrolling
   const resultsRef = useRef<HTMLDivElement>(null);
 
-  // ALWAYS SAVE active state to localStorage on any modification
-  // This guarantees that refreshing/reloading the browser NEVER wipes the calculation!
+  // Always save active state to localStorage
   useEffect(() => {
     try {
       const dataToSave = {
@@ -272,7 +426,7 @@ export default function App() {
     try {
       localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(historyList));
     } catch (e) {
-      console.error('Failed to save history to storage:', e);
+      console.error('Failed to save history:', e);
     }
   }, [historyList]);
 
@@ -280,7 +434,7 @@ export default function App() {
   const rawBill = parseFloat(billAmountInput);
   const rawCount = parseInt(participantsCountInput, 10);
 
-  // Validation: empty, zero or negative check
+  // Strict validation
   const isBillInvalid = isNaN(rawBill) || rawBill <= 0 || billAmountInput.trim() === '';
   const isCountInvalid = isNaN(rawCount) || rawCount <= 0 || participantsCountInput.trim() === '';
   const isInvalid = isBillInvalid || isCountInvalid;
@@ -297,14 +451,13 @@ export default function App() {
     return 0;
   }, [rawBill, tipPercent, customTipInput, isBillInvalid]);
 
-  // Total bill to split in Rupees
+  // Total bill to split
   const totalBillToSplit = useMemo(() => {
     if (isBillInvalid) return 0;
     return rawBill + tipAmount;
   }, [rawBill, tipAmount, isBillInvalid]);
 
   // Exact share calculation down to the rupee and paise
-  // Guarantees sum(shares) === totalBillToSplit exactly
   const shareCalculation = useMemo(() => {
     if (isInvalid) return null;
 
@@ -314,7 +467,6 @@ export default function App() {
     const baseSharePaise = Math.floor(totalPaise / count);
     const remainderPaise = totalPaise % count;
 
-    // Distribute shares so exact paise are matched
     const shares: {
       index: number;
       name: string;
@@ -361,7 +513,7 @@ export default function App() {
     };
   }, [isInvalid, totalBillToSplit, rawCount, participantNames, markedAsPaid]);
 
-  // Calculate what each person paid and net balances
+  // Calculate payments and net balances
   const paymentBreakdown = useMemo(() => {
     if (!shareCalculation) return null;
 
@@ -393,7 +545,6 @@ export default function App() {
         });
       }
     } else {
-      // Custom paid per person
       for (let i = 0; i < count; i++) {
         const share = shareCalculation.shares[i]?.share || 0;
         const entered = parseFloat(customPaidAmounts[i] || '0');
@@ -410,7 +561,6 @@ export default function App() {
       }
     }
 
-    // Settlements
     type Debtor = { name: string; amount: number; index: number };
     type Creditor = { name: string; amount: number; index: number };
 
@@ -461,7 +611,7 @@ export default function App() {
     };
   }, [shareCalculation, rawCount, totalBillToSplit, payerMode, singlePayerIndex, customPaidAmounts, markedAsPaid]);
 
-  // Helper to format currency in Indian Rupees format
+  // Format currency in Indian Rupees format
   const formatRupee = (amount: number) => {
     return `₹${amount.toLocaleString('en-IN', {
       minimumFractionDigits: 2,
@@ -469,10 +619,31 @@ export default function App() {
     })}`;
   };
 
-  // Handler for 'Split Expense' button
+  // Google Login Handler
+  const handleGoogleSignIn = async () => {
+    try {
+      await signInWithGoogle();
+      showToast('Signed in with Google');
+    } catch (error) {
+      console.error('Google Sign-In failed:', error);
+      showToast('Sign in was interrupted. Please try again.');
+    }
+  };
+
+  // Log Out Handler
+  const handleSignOut = async () => {
+    try {
+      await logOut();
+      showToast('Signed out successfully');
+    } catch (error) {
+      console.error('Sign-Out failed:', error);
+    }
+  };
+
+  // Split Expense Trigger
   const handleSplitExpense = () => {
     setHasSplitSubmitted(true);
-    showToast('Split updated and verified with exact Rupee precision!');
+    showToast('Split calculated with exact precision');
     setTimeout(() => {
       if (resultsRef.current) {
         resultsRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -480,14 +651,13 @@ export default function App() {
     }, 50);
   };
 
-  // REFRESH BUTTON HANDLER: Refreshes view and calculations WITHOUT wiping data!
+  // Refresh Trigger
   const handleRefreshData = () => {
-    // Re-trigger calculation and re-sync without clearing data
     setHasSplitSubmitted(true);
-    showToast('Calculations refreshed and up-to-date!');
+    showToast('Ledger refreshed');
   };
 
-  // CLEAR ALL: Explicitly clears data ONLY when the user clicks 'Clear All'
+  // Clear All
   const handleClearAll = () => {
     try {
       localStorage.removeItem(ACTIVE_STORAGE_KEY);
@@ -504,15 +674,16 @@ export default function App() {
     setMarkedAsPaid({});
     setSinglePayerIndex(0);
     setHasSplitSubmitted(false);
-    showToast('All active bill calculations and inputs cleared!');
+    showToast('Active bill cleared');
   };
 
-  // SAVE CURRENT BILL TO HISTORY
-  const handleSaveToHistory = () => {
+  // Save to History (local + Firestore)
+  const handleSaveToHistory = async () => {
     if (!shareCalculation || !paymentBreakdown) return;
 
+    const splitId = `split-${Date.now()}`;
     const newItem: HistoryItem = {
-      id: `split-${Date.now()}`,
+      id: splitId,
       occasion: occasionName.trim() || 'Dinner Split',
       date: new Date().toLocaleDateString('en-IN', {
         day: 'numeric',
@@ -531,13 +702,29 @@ export default function App() {
       })),
       settlements: paymentBreakdown.settlements,
       isFullySettled: shareCalculation.paidCount === shareCalculation.count,
+      ownerId: currentUser?.uid,
     };
 
-    setHistoryList((prev) => [newItem, ...prev]);
-    showToast(`Saved "${newItem.occasion}" to History!`);
+    setHistoryList((prev) => [newItem, ...prev.filter((i) => i.id !== splitId)]);
+
+    if (currentUser) {
+      const splitDocRef = doc(db, 'users', currentUser.uid, 'splits', splitId);
+      const path = `users/${currentUser.uid}/splits/${splitId}`;
+      try {
+        await setDoc(splitDocRef, {
+          ...newItem,
+          ownerId: currentUser.uid,
+        });
+        showToast('Saved to Cloud Firestore');
+      } catch (err) {
+        handleFirestoreError(err, OperationType.WRITE, path);
+      }
+    } else {
+      showToast('Saved to local history');
+    }
   };
 
-  // Load a historical split back into the active splitter
+  // Restore history record
   const handleRestoreHistoryItem = (item: HistoryItem) => {
     setOccasionName(item.occasion);
     setBillAmountInput(String(item.totalBill));
@@ -559,17 +746,29 @@ export default function App() {
     setPayerMode('single');
     setHasSplitSubmitted(true);
     setActiveTab('splitter');
-    showToast(`Loaded "${item.occasion}" into Active Splitter!`);
+    showToast(`Loaded ${item.occasion}`);
   };
 
-  // Delete an item from history
-  const handleDeleteHistoryItem = (id: string, e: React.MouseEvent) => {
+  // Delete history record
+  const handleDeleteHistoryItem = async (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
     setHistoryList((prev) => prev.filter((item) => item.id !== id));
-    showToast('Item removed from history.');
+
+    if (currentUser) {
+      const splitDocRef = doc(db, 'users', currentUser.uid, 'splits', id);
+      const path = `users/${currentUser.uid}/splits/${id}`;
+      try {
+        await deleteDoc(splitDocRef);
+        showToast('Record deleted from Firestore');
+      } catch (err) {
+        handleFirestoreError(err, OperationType.DELETE, path);
+      }
+    } else {
+      showToast('Record removed');
+    }
   };
 
-  // Toggle "Mark as Paid" for an individual participant
+  // Toggle "Mark as Paid"
   const toggleMarkAsPaid = (index: number) => {
     setMarkedAsPaid((prev) => ({
       ...prev,
@@ -577,7 +776,7 @@ export default function App() {
     }));
   };
 
-  // Mark all as paid or all as unpaid
+  // Batch mark as paid
   const handleMarkAllPaid = (status: boolean) => {
     if (!shareCalculation) return;
     const updated: Record<number, boolean> = {};
@@ -587,7 +786,7 @@ export default function App() {
     setMarkedAsPaid(updated);
   };
 
-  // Pre-fill sample dinner scenario in Rupees
+  // Presets
   const handleLoadSample = (sampleType: 'biryani' | 'pizza' | 'team_lunch') => {
     if (sampleType === 'biryani') {
       setOccasionName('Biryani Night with Friends');
@@ -629,27 +828,27 @@ export default function App() {
     }
     setHasSplitSubmitted(true);
     setActiveTab('splitter');
-    showToast('Loaded sample bill into splitter!');
+    showToast('Loaded preset');
   };
 
-  // Copy share summary for WhatsApp / messaging group chats
+  // Copy share summary
   const handleCopySummary = () => {
     if (!shareCalculation || !paymentBreakdown) return;
 
-    let text = `🧾 Expense Splitter: ${occasionName || 'Bill'}\n`;
-    text += `💰 Total Bill: ${formatRupee(shareCalculation.totalBill)}\n`;
-    text += `👥 Participants: ${shareCalculation.count}\n\n`;
-    text += `Individual Real Shares (Exact Split to ${formatRupee(shareCalculation.totalBill)}):\n`;
+    let text = `Expense Splitter: ${occasionName || 'Bill'}\n`;
+    text += `Total Bill: ${formatRupee(shareCalculation.totalBill)}\n`;
+    text += `Participants: ${shareCalculation.count}\n\n`;
+    text += `Individual Shares:\n`;
 
     shareCalculation.shares.forEach((s) => {
-      text += `• ${s.name}: ${formatRupee(s.share)} [${s.isPaid ? 'PAID ✓' : 'PENDING ⏳'}]\n`;
+      text += `• ${s.name}: ${formatRupee(s.share)} [${s.isPaid ? 'PAID' : 'PENDING'}]\n`;
     });
 
-    text += `\n📊 Payment Status: ${shareCalculation.paidCount} of ${shareCalculation.count} paid (${formatRupee(
+    text += `\nPayment Status: ${shareCalculation.paidCount} of ${shareCalculation.count} paid (${formatRupee(
       shareCalculation.paidAmount
     )} collected)\n`;
 
-    text += `\n💳 What Each Person Paid:\n`;
+    text += `\nWhat Each Person Paid:\n`;
     paymentBreakdown.payments.forEach((p) => {
       text += `• ${p.name}: Paid ${formatRupee(p.paid)} (Fair share: ${formatRupee(p.share)}) -> ${
         p.netBalance > 0
@@ -661,19 +860,179 @@ export default function App() {
     });
 
     if (paymentBreakdown.settlements.length > 0) {
-      text += `\n🤝 Settlement Instructions:\n`;
+      text += `\nSettlement Transfers:\n`;
       paymentBreakdown.settlements.forEach((s) => {
-        text += `• ${s.from} ➔ Pay ${formatRupee(s.amount)} to ${s.to} ${s.isSettled ? '(Received ✓)' : ''}\n`;
+        text += `• ${s.from} -> Pay ${formatRupee(s.amount)} to ${s.to} ${s.isSettled ? '(Received)' : ''}\n`;
       });
     }
 
     navigator.clipboard.writeText(text);
     setCopied(true);
-    showToast('Split summary copied to clipboard!');
+    showToast('Summary copied to clipboard');
     setTimeout(() => setCopied(false), 2500);
   };
 
-  // History filtering
+  // UPI QR Code Generator
+  const handleOpenUpiModal = async (payeeName: string, amount: number, payerName?: string) => {
+    const existingUpi = upiIds[payeeName] || `${payeeName.toLowerCase().replace(/[^a-z0-9]/g, '')}@upi`;
+    const note = `Dinner Share for ${occasionName || 'Bill'}`;
+    const upiUri = `upi://pay?pa=${encodeURIComponent(existingUpi)}&pn=${encodeURIComponent(
+      payeeName
+    )}&am=${amount.toFixed(2)}&cu=INR&tn=${encodeURIComponent(note)}`;
+
+    try {
+      const dataUrl = await QRCode.toDataURL(upiUri, {
+        margin: 2,
+        width: 320,
+        color: {
+          dark: '#0f172a',
+          light: '#ffffff',
+        },
+      });
+      setQrCodeDataUrl(dataUrl);
+      setSelectedUpiModal({
+        payeeName,
+        payerName,
+        amount,
+        upiId: existingUpi,
+        note,
+      });
+      setCustomUpiInput(existingUpi);
+      setIsEditingUpiId(false);
+    } catch (err) {
+      console.error('Failed to generate UPI QR:', err);
+      showToast('Could not generate UPI QR Code');
+    }
+  };
+
+  // Regenerate QR when UPI ID is updated
+  const handleUpdateUpiId = async () => {
+    if (!selectedUpiModal || !customUpiInput.trim()) return;
+    const trimmed = customUpiInput.trim();
+    setUpiIds((prev) => ({
+      ...prev,
+      [selectedUpiModal.payeeName]: trimmed,
+    }));
+
+    const upiUri = `upi://pay?pa=${encodeURIComponent(trimmed)}&pn=${encodeURIComponent(
+      selectedUpiModal.payeeName
+    )}&am=${selectedUpiModal.amount.toFixed(2)}&cu=INR&tn=${encodeURIComponent(selectedUpiModal.note)}`;
+
+    try {
+      const dataUrl = await QRCode.toDataURL(upiUri, {
+        margin: 2,
+        width: 320,
+        color: {
+          dark: '#0f172a',
+          light: '#ffffff',
+        },
+      });
+      setQrCodeDataUrl(dataUrl);
+      setSelectedUpiModal((prev) => (prev ? { ...prev, upiId: trimmed } : null));
+      setIsEditingUpiId(false);
+      showToast(`Updated UPI ID for ${selectedUpiModal.payeeName}`);
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  // Download QR Code
+  const handleDownloadQrCode = () => {
+    if (!qrCodeDataUrl || !selectedUpiModal) return;
+    const a = document.createElement('a');
+    a.href = qrCodeDataUrl;
+    a.download = `UPI-QR-${selectedUpiModal.payeeName}-${selectedUpiModal.amount.toFixed(0)}.png`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    showToast('Downloaded UPI QR Code');
+  };
+
+  // File Exporters
+  const handleDownloadJSON = () => {
+    if (!shareCalculation || !paymentBreakdown) return;
+    const exportData = {
+      occasion: occasionName || 'Expense Split',
+      exportedAt: new Date().toISOString(),
+      currency: 'INR (₹)',
+      billAmount: rawBill,
+      tipAmount: tipAmount,
+      totalBill: shareCalculation.totalBill,
+      participantsCount: shareCalculation.count,
+      shares: shareCalculation.shares,
+      payments: paymentBreakdown.payments,
+      settlements: paymentBreakdown.settlements,
+    };
+    downloadFile(
+      JSON.stringify(exportData, null, 2),
+      `${(occasionName || 'expense-split').toLowerCase().replace(/\s+/g, '-')}.json`,
+      'application/json'
+    );
+    showToast('Downloaded JSON file');
+    setShowDownloadModal(false);
+  };
+
+  const handleDownloadCSV = () => {
+    if (!shareCalculation || !paymentBreakdown) return;
+    let csv = `Participant,Fair Share (INR),Amount Paid (INR),Net Balance (INR),Status\n`;
+    paymentBreakdown.payments.forEach((p) => {
+      const isPaid = markedAsPaid[p.index] ? 'PAID' : 'PENDING';
+      csv += `"${p.name}",${p.share.toFixed(2)},${p.paid.toFixed(2)},${p.netBalance.toFixed(2)},${isPaid}\n`;
+    });
+    csv += `\nTotal Bill,${shareCalculation.totalBill.toFixed(2)}\n`;
+    csv += `Total Participants,${shareCalculation.count}\n`;
+    downloadFile(
+      csv,
+      `${(occasionName || 'expense-split').toLowerCase().replace(/\s+/g, '-')}.csv`,
+      'text/csv'
+    );
+    showToast('Downloaded CSV file');
+    setShowDownloadModal(false);
+  };
+
+  const handleDownloadTXT = () => {
+    if (!shareCalculation || !paymentBreakdown) return;
+    let receipt = `=================================================\n`;
+    receipt += `             EXPENSE SPLITTER RECEIPT            \n`;
+    receipt += `=================================================\n`;
+    receipt += `Occasion:       ${occasionName || 'Dinner with Friends'}\n`;
+    receipt += `Date:           ${new Date().toLocaleString('en-IN')}\n`;
+    receipt += `Total Bill:     ${formatRupee(shareCalculation.totalBill)}\n`;
+    receipt += `Participants:   ${shareCalculation.count}\n`;
+    receipt += `-------------------------------------------------\n`;
+    receipt += `INDIVIDUAL SHARES (Exact to the paisa):\n`;
+    shareCalculation.shares.forEach((s) => {
+      receipt += `  ${s.name.padEnd(20)} : ${formatRupee(s.share)} [${s.isPaid ? 'PAID' : 'PENDING'}]\n`;
+    });
+    receipt += `-------------------------------------------------\n`;
+    receipt += `WHAT EACH PERSON PAID:\n`;
+    paymentBreakdown.payments.forEach((p) => {
+      const balanceStr =
+        p.netBalance > 0
+          ? `+${formatRupee(p.netBalance)} (Gets back)`
+          : p.netBalance < 0
+          ? `-${formatRupee(Math.abs(p.netBalance))} (Owes)`
+          : `Settled`;
+      receipt += `  ${p.name.padEnd(20)} : Paid ${formatRupee(p.paid)} | ${balanceStr}\n`;
+    });
+    if (paymentBreakdown.settlements.length > 0) {
+      receipt += `-------------------------------------------------\n`;
+      receipt += `SETTLEMENT INSTRUCTIONS:\n`;
+      paymentBreakdown.settlements.forEach((s) => {
+        receipt += `  ${s.from} -> Pay ${formatRupee(s.amount)} to ${s.to}\n`;
+      });
+    }
+    receipt += `=================================================\n`;
+    downloadFile(
+      receipt,
+      `${(occasionName || 'expense-split').toLowerCase().replace(/\s+/g, '-')}-receipt.txt`,
+      'text/plain'
+    );
+    showToast('Downloaded receipt file');
+    setShowDownloadModal(false);
+  };
+
+  // Filter history
   const filteredHistory = useMemo(() => {
     if (!historySearchQuery.trim()) return historyList;
     const q = historySearchQuery.toLowerCase();
@@ -684,7 +1043,7 @@ export default function App() {
     );
   }, [historyList, historySearchQuery]);
 
-  // Aggregate stats for Dashboard
+  // Aggregate stats
   const dashboardStats = useMemo(() => {
     const totalHistoryAmount = historyList.reduce((acc, curr) => acc + curr.totalBill, 0);
     const fullySettledCount = historyList.filter((item) => item.isFullySettled).length;
@@ -704,199 +1063,584 @@ export default function App() {
 
   return (
     <div
-      className={`min-h-screen font-sans antialiased transition-colors duration-200 ${
+      className={`min-h-screen font-sans antialiased relative selection:bg-emerald-500/30 ${
         theme === 'dark'
-          ? 'bg-slate-950 text-slate-100 selection:bg-slate-800'
-          : 'bg-white text-slate-900 selection:bg-slate-200'
+          ? 'bg-slate-950 text-slate-100'
+          : 'bg-slate-50 text-slate-900'
       }`}
     >
+      {/* Ambient background glows for Glassmorphism depth */}
+      <div className="fixed inset-0 pointer-events-none overflow-hidden z-0">
+        <div
+          className={`absolute -top-40 -left-40 w-96 h-96 rounded-full blur-3xl opacity-25 ${
+            theme === 'dark' ? 'bg-emerald-600' : 'bg-emerald-300'
+          }`}
+        />
+        <div
+          className={`absolute top-1/3 -right-40 w-96 h-96 rounded-full blur-3xl opacity-20 ${
+            theme === 'dark' ? 'bg-cyan-600' : 'bg-blue-200'
+          }`}
+        />
+        <div
+          className={`absolute -bottom-40 left-1/3 w-96 h-96 rounded-full blur-3xl opacity-20 ${
+            theme === 'dark' ? 'bg-teal-600' : 'bg-teal-200'
+          }`}
+        />
+      </div>
+
       {/* Toast Notification */}
       {toastMessage && (
-        <div className="fixed top-20 right-4 z-50 bg-emerald-600 text-white text-xs font-semibold px-4 py-2.5 rounded-xl shadow-xl flex items-center gap-2 animate-fade-in border border-emerald-500">
-          <CheckCircle2 className="w-4 h-4 shrink-0" />
+        <div className="fixed top-20 right-4 z-50 backdrop-blur-xl bg-slate-900/90 dark:bg-emerald-950/90 text-white text-xs font-semibold px-4 py-2.5 rounded-2xl shadow-xl flex items-center gap-2 border border-slate-700/50 dark:border-emerald-700/50">
+          <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
           <span>{toastMessage}</span>
         </div>
       )}
 
-      {/* Top Header */}
+      {/* MODAL: UPI QR Code for settlement */}
+      {selectedUpiModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-md animate-fade-in">
+          <div
+            className={`w-full max-w-sm rounded-3xl border p-6 shadow-2xl backdrop-blur-2xl transition-all ${
+              theme === 'dark'
+                ? 'bg-slate-900/85 border-slate-800 text-white shadow-emerald-950/30'
+                : 'bg-white/90 border-white/60 text-slate-900 shadow-slate-200/50'
+            }`}
+          >
+            <div className="flex items-center justify-between pb-3 border-b border-slate-200/50 dark:border-slate-800/80 mb-4">
+              <div className="flex items-center gap-2">
+                <QrCode className="w-5 h-5 text-emerald-500" />
+                <h3 className="font-bold text-base tracking-tight">UPI Payment QR</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setSelectedUpiModal(null)}
+                className="w-7 h-7 rounded-full flex items-center justify-center text-xs text-slate-400 hover:text-slate-100 hover:bg-slate-800/50 cursor-pointer"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="text-center space-y-3">
+              {/* Payee & Amount details */}
+              <div>
+                <p className="text-xs text-slate-400 font-medium">
+                  {selectedUpiModal.payerName ? (
+                    <>
+                      <span className="font-semibold text-slate-700 dark:text-slate-200">
+                        {selectedUpiModal.payerName}
+                      </span>{' '}
+                      pays to
+                    </>
+                  ) : (
+                    'Pay to'
+                  )}
+                </p>
+                <h4 className="text-lg font-extrabold tracking-tight mt-0.5">
+                  {selectedUpiModal.payeeName}
+                </h4>
+                <div className="mt-1 inline-flex items-center gap-1.5 px-3 py-1 rounded-xl bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 font-mono text-xl font-extrabold">
+                  {formatRupee(selectedUpiModal.amount)}
+                </div>
+              </div>
+
+              {/* QR Code Container with sleek frosted border */}
+              <div className="p-3 bg-white rounded-2xl shadow-inner border border-slate-200/60 inline-block">
+                {qrCodeDataUrl ? (
+                  <img
+                    src={qrCodeDataUrl}
+                    alt="UPI QR Code"
+                    className="w-56 h-56 mx-auto rounded-lg"
+                  />
+                ) : (
+                  <div className="w-56 h-56 flex items-center justify-center text-slate-400 text-xs">
+                    Generating QR...
+                  </div>
+                )}
+              </div>
+
+              {/* Payee UPI ID with edit capability */}
+              <div className="px-3 py-2 rounded-xl bg-slate-100/70 dark:bg-slate-800/60 border border-slate-200/50 dark:border-slate-700/50 text-xs">
+                {isEditingUpiId ? (
+                  <div className="flex items-center gap-1.5">
+                    <input
+                      type="text"
+                      placeholder="e.g. name@okhdfcbank"
+                      value={customUpiInput}
+                      onChange={(e) => setCustomUpiInput(e.target.value)}
+                      className="flex-1 px-2 py-1 text-xs rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-slate-900 dark:text-white font-mono"
+                    />
+                    <button
+                      type="button"
+                      onClick={handleUpdateUpiId}
+                      className="px-2.5 py-1 bg-emerald-600 text-white rounded-lg text-xs font-semibold cursor-pointer"
+                    >
+                      Save
+                    </button>
+                  </div>
+                ) : (
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <span className="text-slate-400 font-medium">UPI ID:</span>
+                      <span className="font-mono font-semibold truncate text-slate-800 dark:text-slate-200">
+                        {selectedUpiModal.upiId}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setIsEditingUpiId(true)}
+                      className="text-[11px] text-emerald-500 hover:underline flex items-center gap-1 cursor-pointer ml-1"
+                    >
+                      <Edit3 className="w-3 h-3" />
+                      <span>Edit</span>
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              <p className="text-[11px] text-slate-400">
+                Scan with Google Pay, PhonePe, Paytm, or BHIM UPI
+              </p>
+
+              {/* Actions: Download QR + Open UPI App */}
+              <div className="flex items-center gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={handleDownloadQrCode}
+                  className={`flex-1 py-2.5 px-3 rounded-xl border text-xs font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer ${
+                    theme === 'dark'
+                      ? 'border-slate-700 hover:bg-slate-800 text-slate-200'
+                      : 'border-slate-300 hover:bg-slate-50 text-slate-800'
+                  }`}
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Save QR</span>
+                </button>
+
+                <a
+                  href={`upi://pay?pa=${encodeURIComponent(selectedUpiModal.upiId)}&pn=${encodeURIComponent(
+                    selectedUpiModal.payeeName
+                  )}&am=${selectedUpiModal.amount.toFixed(2)}&cu=INR&tn=${encodeURIComponent(
+                    selectedUpiModal.note
+                  )}`}
+                  className="flex-1 py-2.5 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold flex items-center justify-center gap-1.5 shadow-sm transition"
+                >
+                  <ExternalLink className="w-3.5 h-3.5" />
+                  <span>Pay App</span>
+                </a>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: Server & Hosting Links */}
+      {showServerModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-md animate-fade-in">
+          <div
+            className={`w-full max-w-md rounded-3xl border p-6 shadow-2xl backdrop-blur-2xl transition-all ${
+              theme === 'dark'
+                ? 'bg-slate-900/85 border-slate-800 text-white'
+                : 'bg-white/90 border-white/60 text-slate-900'
+            }`}
+          >
+            <div className="flex items-center justify-between pb-3 border-b border-slate-200/50 dark:border-slate-800/80 mb-4">
+              <div className="flex items-center gap-2">
+                <Laptop className="w-5 h-5 text-emerald-500" />
+                <h3 className="font-bold text-base">Server & Host Information</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowServerModal(false)}
+                className="w-7 h-7 rounded-full flex items-center justify-center text-xs text-slate-400 hover:text-slate-100 hover:bg-slate-800/50 cursor-pointer"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="space-y-4 text-xs">
+              <div className="p-3.5 rounded-2xl border border-slate-200/60 dark:border-slate-800/80 bg-white/50 dark:bg-slate-800/40">
+                <div className="flex items-center justify-between mb-1">
+                  <span className="font-bold flex items-center gap-1.5 text-slate-800 dark:text-slate-200">
+                    <Laptop className="w-4 h-4 text-emerald-500" />
+                    Local Server Link
+                  </span>
+                  <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-600 dark:text-emerald-400">
+                    Port 3000
+                  </span>
+                </div>
+                <div className="flex items-center gap-2 mt-2">
+                  <code className="flex-1 p-2 rounded-xl bg-slate-100/80 dark:bg-slate-900/80 border border-slate-200/60 dark:border-slate-700/60 text-slate-800 dark:text-slate-200 font-mono text-xs select-all">
+                    http://localhost:3000
+                  </code>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      navigator.clipboard.writeText('http://localhost:3000');
+                      showToast('Copied local server link');
+                    }}
+                    className="p-2 rounded-xl bg-slate-900 dark:bg-slate-700 text-white text-xs hover:opacity-90 cursor-pointer"
+                  >
+                    <Copy className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              </div>
+
+              <div className="p-3.5 rounded-2xl border border-slate-200/60 dark:border-slate-800/80 bg-white/50 dark:bg-slate-800/40">
+                <div className="flex items-center justify-between mb-1">
+                  <span className="font-bold flex items-center gap-1.5 text-slate-800 dark:text-slate-200">
+                    <CloudCheck className="w-4 h-4 text-emerald-500" />
+                    Live Cloud App URL
+                  </span>
+                  <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-600 dark:text-emerald-400">
+                    Active
+                  </span>
+                </div>
+                <div className="flex items-center gap-2 mt-2">
+                  <code className="flex-1 p-2 rounded-xl bg-slate-100/80 dark:bg-slate-900/80 border border-slate-200/60 dark:border-slate-700/60 text-slate-800 dark:text-slate-200 font-mono text-[11px] truncate select-all">
+                    https://ais-dev-i4ys7dybooehnia44acw2n-691660099830.asia-east1.run.app
+                  </code>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      navigator.clipboard.writeText('https://ais-dev-i4ys7dybooehnia44acw2n-691660099830.asia-east1.run.app');
+                      showToast('Copied Cloud App URL');
+                    }}
+                    className="p-2 rounded-xl bg-slate-900 dark:bg-slate-700 text-white text-xs hover:opacity-90 cursor-pointer"
+                  >
+                    <Copy className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div className="mt-5 pt-3 border-t border-slate-200/50 dark:border-slate-800/80 text-right">
+              <button
+                type="button"
+                onClick={() => setShowServerModal(false)}
+                className="px-4 py-2 rounded-xl bg-slate-900 dark:bg-slate-800 text-white text-xs font-semibold cursor-pointer"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: Download Export Options */}
+      {showDownloadModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-md animate-fade-in">
+          <div
+            className={`w-full max-w-md rounded-3xl border p-6 shadow-2xl backdrop-blur-2xl transition-all ${
+              theme === 'dark'
+                ? 'bg-slate-900/85 border-slate-800 text-white'
+                : 'bg-white/90 border-white/60 text-slate-900'
+            }`}
+          >
+            <div className="flex items-center justify-between pb-3 border-b border-slate-200/50 dark:border-slate-800/80 mb-4">
+              <div className="flex items-center gap-2">
+                <Download className="w-5 h-5 text-emerald-500" />
+                <h3 className="font-bold text-base">Export Bill Record</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowDownloadModal(false)}
+                className="w-7 h-7 rounded-full flex items-center justify-center text-xs text-slate-400 hover:text-slate-100 hover:bg-slate-800/50 cursor-pointer"
+              >
+                ✕
+              </button>
+            </div>
+
+            <p className="text-xs text-slate-500 dark:text-slate-400 mb-4">
+              Select an export format for your current dinner settlement:
+            </p>
+
+            <div className="space-y-3">
+              <button
+                type="button"
+                onClick={handleDownloadTXT}
+                className={`w-full p-3.5 rounded-2xl border flex items-center justify-between text-left transition hover:scale-[1.01] cursor-pointer ${
+                  theme === 'dark'
+                    ? 'border-slate-800 bg-slate-800/50 hover:border-emerald-500/50'
+                    : 'border-slate-200/70 bg-white/60 hover:border-emerald-500/50'
+                }`}
+              >
+                <div className="flex items-center gap-3">
+                  <div className="p-2 rounded-xl bg-emerald-500/10 text-emerald-500">
+                    <FileText className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h4 className="font-bold text-xs sm:text-sm">Itemized Receipt (.txt)</h4>
+                    <p className="text-[11px] text-slate-400">
+                      Printable formatted ledger with all individual balances
+                    </p>
+                  </div>
+                </div>
+                <Download className="w-4 h-4 text-slate-400" />
+              </button>
+
+              <button
+                type="button"
+                onClick={handleDownloadCSV}
+                className={`w-full p-3.5 rounded-2xl border flex items-center justify-between text-left transition hover:scale-[1.01] cursor-pointer ${
+                  theme === 'dark'
+                    ? 'border-slate-800 bg-slate-800/50 hover:border-emerald-500/50'
+                    : 'border-slate-200/70 bg-white/60 hover:border-emerald-500/50'
+                }`}
+              >
+                <div className="flex items-center gap-3">
+                  <div className="p-2 rounded-xl bg-blue-500/10 text-blue-500">
+                    <FileSpreadsheet className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h4 className="font-bold text-xs sm:text-sm">Spreadsheet (.csv)</h4>
+                    <p className="text-[11px] text-slate-400">
+                      Excel and Google Sheets compatible table
+                    </p>
+                  </div>
+                </div>
+                <Download className="w-4 h-4 text-slate-400" />
+              </button>
+
+              <button
+                type="button"
+                onClick={handleDownloadJSON}
+                className={`w-full p-3.5 rounded-2xl border flex items-center justify-between text-left transition hover:scale-[1.01] cursor-pointer ${
+                  theme === 'dark'
+                    ? 'border-slate-800 bg-slate-800/50 hover:border-emerald-500/50'
+                    : 'border-slate-200/70 bg-white/60 hover:border-emerald-500/50'
+                }`}
+              >
+                <div className="flex items-center gap-3">
+                  <div className="p-2 rounded-xl bg-amber-500/10 text-amber-500">
+                    <FileCode className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h4 className="font-bold text-xs sm:text-sm">Structured Ledger (.json)</h4>
+                    <p className="text-[11px] text-slate-400">
+                      Complete object format with integer cent distributions
+                    </p>
+                  </div>
+                </div>
+                <Download className="w-4 h-4 text-slate-400" />
+              </button>
+            </div>
+
+            <div className="mt-5 pt-3 border-t border-slate-200/50 dark:border-slate-800/80 text-right">
+              <button
+                type="button"
+                onClick={() => setShowDownloadModal(false)}
+                className="px-4 py-2 rounded-xl border border-slate-300 dark:border-slate-700 text-xs font-semibold cursor-pointer"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Top Glassmorphic Navigation Bar */}
       <header
-        className={`border-b sticky top-0 z-30 shadow-xs transition-colors duration-200 ${
-          theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'
+        className={`sticky top-0 z-30 backdrop-blur-xl border-b transition-colors duration-200 ${
+          theme === 'dark'
+            ? 'bg-slate-900/75 border-slate-800/80'
+            : 'bg-white/75 border-white/60 shadow-xs'
         }`}
       >
-        <div className="max-w-6xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between">
-          {/* Logo & Title */}
+        <div className="max-w-6xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between relative z-10">
+          {/* Logo & Brand */}
           <div className="flex items-center gap-3">
-            <div
-              className={`w-10 h-10 rounded-xl flex items-center justify-center shadow-xs transition-colors ${
-                theme === 'dark' ? 'bg-emerald-500 text-slate-950' : 'bg-slate-900 text-white'
-              }`}
-            >
+            <div className="w-10 h-10 rounded-2xl bg-gradient-to-tr from-emerald-600 to-teal-500 text-white flex items-center justify-center shadow-md shadow-emerald-500/20">
               <Split className="w-5 h-5" />
             </div>
             <div>
-              <h1
-                className={`font-bold text-lg sm:text-xl tracking-tight leading-tight ${
-                  theme === 'dark' ? 'text-white' : 'text-slate-900'
-                }`}
-              >
-                Expense Splitter
-              </h1>
-              <p className={`text-[11px] sm:text-xs font-medium ${theme === 'dark' ? 'text-slate-400' : 'text-slate-500'}`}>
-                Fair, fast, & exact Rupee (₹) bill splitting
+              <div className="flex items-center gap-2">
+                <h1 className="font-extrabold text-lg sm:text-xl tracking-tight leading-tight">
+                  Expense Splitter
+                </h1>
+                {currentUser && (
+                  <span className="hidden sm:inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-600 dark:text-emerald-400">
+                    <CloudCheck className="w-3 h-3" />
+                    <span>Cloud Active</span>
+                  </span>
+                )}
+              </div>
+              <p className="text-[11px] sm:text-xs text-slate-400 font-medium">
+                Fair & exact Rupee settlement engine
               </p>
             </div>
           </div>
 
-          {/* Action Buttons: Refresh + Dark/Light Mode Toggle + Clear All */}
+          {/* Action Bar */}
           <div className="flex items-center gap-2 sm:gap-2.5">
-            {/* REFRESH BUTTON: Refresh calculation & view WITHOUT removing data */}
+            <button
+              type="button"
+              onClick={() => setShowServerModal(true)}
+              title="View Local & Cloud Server Links"
+              className={`text-xs font-semibold px-2.5 py-1.5 rounded-xl border backdrop-blur-md transition-colors flex items-center gap-1.5 cursor-pointer ${
+                theme === 'dark'
+                  ? 'border-slate-800 bg-slate-800/50 text-slate-300 hover:text-white hover:bg-slate-800'
+                  : 'border-slate-200/80 bg-white/60 text-slate-700 hover:bg-white'
+              }`}
+            >
+              <Laptop className="w-3.5 h-3.5 text-emerald-500" />
+              <span className="hidden md:inline">Server</span>
+            </button>
+
+            {/* Google Authentication Button / User Chip */}
+            {currentUser ? (
+              <div
+                className={`flex items-center gap-2 pl-2 pr-1.5 py-1 rounded-2xl border backdrop-blur-md text-xs font-medium ${
+                  theme === 'dark'
+                    ? 'border-slate-800 bg-slate-800/60'
+                    : 'border-slate-200/80 bg-white/80'
+                }`}
+              >
+                {currentUser.photoURL ? (
+                  <img
+                    src={currentUser.photoURL}
+                    alt="User"
+                    className="w-5 h-5 rounded-full"
+                  />
+                ) : (
+                  <div className="w-5 h-5 rounded-full bg-emerald-500 text-slate-950 font-bold flex items-center justify-center text-[10px]">
+                    {currentUser.displayName ? currentUser.displayName.charAt(0) : 'U'}
+                  </div>
+                )}
+                <span className="max-w-[70px] sm:max-w-[100px] truncate text-xs font-bold">
+                  {currentUser.displayName || currentUser.email?.split('@')[0]}
+                </span>
+                <button
+                  type="button"
+                  onClick={handleSignOut}
+                  title="Sign Out"
+                  className="p-1 rounded-lg text-slate-400 hover:text-rose-500 cursor-pointer ml-0.5"
+                >
+                  <LogOut className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={handleGoogleSignIn}
+                disabled={authLoading}
+                title="Sign in with Google"
+                className="text-xs font-bold px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white transition-all flex items-center gap-1.5 cursor-pointer shadow-xs"
+              >
+                <LogIn className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Sign In</span>
+              </button>
+            )}
+
+            {/* Recalculate / Refresh */}
             <button
               type="button"
               onClick={handleRefreshData}
-              title="Refresh and recalculate (keeps your data safe)"
-              aria-label="Refresh view and calculation"
-              className={`text-xs font-semibold px-2.5 sm:px-3 py-1.5 rounded-lg border transition-colors flex items-center gap-1.5 cursor-pointer ${
+              title="Refresh ledger"
+              className={`p-2 rounded-xl border backdrop-blur-md transition-colors flex items-center justify-center cursor-pointer ${
                 theme === 'dark'
-                  ? 'border-slate-700 text-slate-300 hover:text-white hover:bg-slate-800'
-                  : 'border-slate-200 text-slate-600 hover:text-slate-900 hover:bg-slate-50'
+                  ? 'border-slate-800 bg-slate-800/50 text-slate-300 hover:text-white'
+                  : 'border-slate-200/80 bg-white/60 text-slate-700 hover:bg-white'
               }`}
             >
-              <RefreshCw className="w-3.5 h-3.5 text-emerald-500" />
-              <span className="hidden sm:inline">Refresh</span>
+              <RefreshCw className="w-4 h-4 text-emerald-500" />
             </button>
 
-            {/* DARK / LIGHT MODE TOGGLE KEY (Just beside the refresh button) */}
+            {/* Dark/Light Mode Switch */}
             <button
               type="button"
               onClick={toggleTheme}
               title={`Switch to ${theme === 'light' ? 'Dark' : 'Light'} Mode`}
-              aria-label="Toggle dark/light mode"
-              className={`p-2 rounded-lg border transition-all duration-200 flex items-center justify-center cursor-pointer shadow-2xs ${
+              className={`p-2 rounded-xl border backdrop-blur-md transition-all cursor-pointer ${
                 theme === 'dark'
-                  ? 'bg-slate-800 border-slate-700 text-amber-300 hover:bg-slate-700 hover:text-amber-200'
-                  : 'bg-slate-100 border-slate-200 text-slate-700 hover:bg-slate-200 hover:text-slate-900'
+                  ? 'bg-slate-800/60 border-slate-700/80 text-amber-300 hover:bg-slate-750'
+                  : 'bg-white/70 border-slate-200/80 text-slate-700 hover:bg-white'
               }`}
             >
-              {theme === 'dark' ? (
-                <Sun className="w-4 h-4 transition-transform hover:rotate-45" />
-              ) : (
-                <Moon className="w-4 h-4 transition-transform hover:-rotate-12" />
-              )}
+              {theme === 'dark' ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
             </button>
 
-            {/* CLEAR ALL BUTTON: Clears all calculations & data when bill is done */}
+            {/* Clear All */}
             <button
               type="button"
               onClick={handleClearAll}
-              title="Clear all calculations and data when bill is done"
-              className="text-xs font-bold px-3 py-1.5 rounded-lg bg-rose-50 text-rose-700 border border-rose-200 hover:bg-rose-100 hover:border-rose-300 transition-colors flex items-center gap-1.5 cursor-pointer shadow-2xs"
+              title="Clear calculations"
+              className="p-2 rounded-xl bg-rose-500/10 text-rose-600 dark:text-rose-400 border border-rose-500/20 hover:bg-rose-500/20 transition-colors cursor-pointer"
             >
-              <Trash2 className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">Clear All</span>
+              <Trash2 className="w-4 h-4" />
             </button>
           </div>
         </div>
 
-        {/* Navigation Tabs Bar for Dashboard, Splitter & History */}
+        {/* Tab Navigation */}
         <div
           className={`border-t px-4 sm:px-6 transition-colors duration-200 ${
-            theme === 'dark' ? 'border-slate-800 bg-slate-900/60' : 'border-slate-200 bg-slate-50/70'
+            theme === 'dark' ? 'border-slate-800/80 bg-slate-900/40' : 'border-slate-200/60 bg-white/40'
           }`}
         >
           <div className="max-w-6xl mx-auto flex items-center justify-between">
             <nav className="flex space-x-1 sm:space-x-2 py-2 overflow-x-auto">
-              {/* Tab 1: Dashboard */}
               <button
                 type="button"
                 onClick={() => setActiveTab('dashboard')}
-                className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-2 transition cursor-pointer shrink-0 ${
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-2 transition cursor-pointer shrink-0 ${
                   activeTab === 'dashboard'
-                    ? theme === 'dark'
-                      ? 'bg-emerald-500 text-slate-950 shadow-xs'
-                      : 'bg-slate-900 text-white shadow-xs'
-                    : theme === 'dark'
-                    ? 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'
-                    : 'text-slate-600 hover:text-slate-900 hover:bg-slate-200/60'
+                    ? 'bg-emerald-600 text-white shadow-xs'
+                    : 'text-slate-400 hover:text-slate-800 dark:hover:text-white'
                 }`}
               >
                 <LayoutDashboard className="w-3.5 h-3.5" />
                 <span>Dashboard</span>
               </button>
 
-              {/* Tab 2: Splitter (Active Bill) */}
               <button
                 type="button"
                 onClick={() => setActiveTab('splitter')}
-                className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-2 transition cursor-pointer shrink-0 ${
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-2 transition cursor-pointer shrink-0 ${
                   activeTab === 'splitter'
-                    ? theme === 'dark'
-                      ? 'bg-emerald-500 text-slate-950 shadow-xs'
-                      : 'bg-slate-900 text-white shadow-xs'
-                    : theme === 'dark'
-                    ? 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'
-                    : 'text-slate-600 hover:text-slate-900 hover:bg-slate-200/60'
+                    ? 'bg-emerald-600 text-white shadow-xs'
+                    : 'text-slate-400 hover:text-slate-800 dark:hover:text-white'
                 }`}
               >
                 <Split className="w-3.5 h-3.5" />
                 <span>Splitter</span>
                 {!isInvalid && shareCalculation && (
-                  <span className="text-[10px] px-1.5 py-0.2 rounded-full font-mono bg-emerald-500/20 text-emerald-600 dark:text-emerald-400">
+                  <span className="text-[10px] px-1.5 py-0.2 rounded-full font-mono bg-white/20 text-white">
                     {formatRupee(shareCalculation.totalBill)}
                   </span>
                 )}
               </button>
 
-              {/* Tab 3: History & Tracking */}
               <button
                 type="button"
                 onClick={() => setActiveTab('history')}
-                className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-2 transition cursor-pointer shrink-0 ${
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-2 transition cursor-pointer shrink-0 ${
                   activeTab === 'history'
-                    ? theme === 'dark'
-                      ? 'bg-emerald-500 text-slate-950 shadow-xs'
-                      : 'bg-slate-900 text-white shadow-xs'
-                    : theme === 'dark'
-                    ? 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'
-                    : 'text-slate-600 hover:text-slate-900 hover:bg-slate-200/60'
+                    ? 'bg-emerald-600 text-white shadow-xs'
+                    : 'text-slate-400 hover:text-slate-800 dark:hover:text-white'
                 }`}
               >
                 <HistoryIcon className="w-3.5 h-3.5" />
-                <span>Split History</span>
-                <span
-                  className={`text-[10px] px-1.5 py-0.2 rounded-full font-bold ${
-                    theme === 'dark' ? 'bg-slate-800 text-slate-300' : 'bg-slate-200 text-slate-700'
-                  }`}
-                >
+                <span>History</span>
+                <span className="text-[10px] px-1.5 py-0.2 rounded-full font-bold bg-slate-500/20">
                   {historyList.length}
                 </span>
               </button>
             </nav>
 
-            {/* Quick Demo Presets */}
+            {/* Presets */}
             <div className="hidden md:flex items-center gap-1.5 pl-2 text-xs">
-              <span className={`font-medium ${theme === 'dark' ? 'text-slate-500' : 'text-slate-400'}`}>
-                Presets:
-              </span>
+              <span className="font-medium text-slate-400">Presets:</span>
               <button
                 type="button"
                 onClick={() => handleLoadSample('biryani')}
-                className={`px-2.5 py-1 rounded-md font-medium transition cursor-pointer ${
-                  theme === 'dark'
-                    ? 'bg-slate-800 hover:bg-slate-700 text-slate-200'
-                    : 'bg-slate-200/80 hover:bg-slate-200 text-slate-800'
-                }`}
+                className="px-2.5 py-1 rounded-lg text-xs font-medium bg-slate-200/50 dark:bg-slate-800/50 hover:bg-emerald-500/10 hover:text-emerald-500 transition cursor-pointer"
               >
                 Biryani 4x
               </button>
               <button
                 type="button"
                 onClick={() => handleLoadSample('pizza')}
-                className={`px-2.5 py-1 rounded-md font-medium transition cursor-pointer ${
-                  theme === 'dark'
-                    ? 'bg-slate-800 hover:bg-slate-700 text-slate-200'
-                    : 'bg-slate-200/80 hover:bg-slate-200 text-slate-800'
-                }`}
+                className="px-2.5 py-1 rounded-lg text-xs font-medium bg-slate-200/50 dark:bg-slate-800/50 hover:bg-emerald-500/10 hover:text-emerald-500 transition cursor-pointer"
               >
                 Pizza 3x
               </button>
@@ -905,33 +1649,33 @@ export default function App() {
         </div>
       </header>
 
-      {/* Main Container */}
-      <main className="max-w-6xl mx-auto px-4 sm:px-6 py-6 sm:py-8">
+      {/* Main View Area */}
+      <main className="max-w-6xl mx-auto px-4 sm:px-6 py-6 sm:py-8 relative z-10">
         
         {/* ============================================================== */}
-        {/* VIEW 1: DASHBOARD (Accessible Overview of All Features & Stats) */}
+        {/* VIEW 1: DASHBOARD                                              */}
         {/* ============================================================== */}
         {activeTab === 'dashboard' && (
           <div className="space-y-6 animate-fade-in">
-            {/* Dashboard Hero Banner */}
+            {/* Glassmorphic Overview Card */}
             <div
-              className={`rounded-2xl border p-6 sm:p-8 shadow-sm transition-colors duration-200 ${
+              className={`rounded-3xl border p-6 sm:p-8 backdrop-blur-xl shadow-lg transition-all ${
                 theme === 'dark'
-                  ? 'bg-gradient-to-br from-slate-900 to-slate-950 border-slate-800'
-                  : 'bg-gradient-to-br from-slate-50 via-white to-slate-100 border-slate-200'
+                  ? 'bg-slate-900/60 border-slate-800/80 shadow-black/20'
+                  : 'bg-white/70 border-white/60 shadow-slate-200/50'
               }`}
             >
               <div className="flex flex-col md:flex-row md:items-center justify-between gap-6">
                 <div>
                   <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 text-xs font-bold mb-3">
                     <TrendingUp className="w-3.5 h-3.5" />
-                    Splitter Overview & Control Center
+                    Dining & Bill Management
                   </span>
                   <h2 className="text-2xl sm:text-3xl font-extrabold tracking-tight">
-                    Dinner Bill Command Dashboard
+                    Expense Split Command Center
                   </h2>
-                  <p className="text-sm text-slate-500 dark:text-slate-400 max-w-xl mt-1 leading-relaxed">
-                    Track your current active bill, view collection progress, record payments, and inspect past split history—all in one place.
+                  <p className="text-xs sm:text-sm text-slate-400 max-w-xl mt-1 leading-relaxed">
+                    Instant UPI settlements, zero-paise discrepancy distribution, and cross-device sync.
                   </p>
                 </div>
 
@@ -939,51 +1683,53 @@ export default function App() {
                   <button
                     type="button"
                     onClick={() => setActiveTab('splitter')}
-                    className="px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs sm:text-sm flex items-center gap-2 shadow-sm transition cursor-pointer"
+                    className="px-4 py-2.5 rounded-2xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs sm:text-sm flex items-center gap-2 shadow-sm transition cursor-pointer"
                   >
                     <Split className="w-4 h-4" />
-                    <span>Open Splitter</span>
+                    <span>Open Calculator</span>
                   </button>
                   <button
                     type="button"
-                    onClick={() => setActiveTab('history')}
-                    className={`px-4 py-2.5 rounded-xl border font-bold text-xs sm:text-sm flex items-center gap-2 transition cursor-pointer ${
+                    onClick={() => setShowDownloadModal(true)}
+                    className={`px-4 py-2.5 rounded-2xl border font-bold text-xs sm:text-sm flex items-center gap-2 backdrop-blur-md transition cursor-pointer ${
                       theme === 'dark'
-                        ? 'border-slate-700 bg-slate-800 hover:bg-slate-700 text-slate-200'
-                        : 'border-slate-300 bg-white hover:bg-slate-50 text-slate-800'
+                        ? 'border-slate-800 bg-slate-800/60 hover:bg-slate-800 text-white'
+                        : 'border-slate-200/80 bg-white/70 hover:bg-white text-slate-800'
                     }`}
                   >
-                    <HistoryIcon className="w-4 h-4 text-emerald-500" />
-                    <span>View History</span>
+                    <Download className="w-4 h-4 text-emerald-500" />
+                    <span>Export Bill</span>
                   </button>
                 </div>
               </div>
             </div>
 
-            {/* Dashboard Metric Cards */}
+            {/* Metrics */}
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-              {/* Card 1: Active Bill */}
               <div
-                className={`p-5 rounded-2xl border shadow-xs transition-colors ${
-                  theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'
+                className={`p-5 rounded-3xl border backdrop-blur-xl transition-all ${
+                  theme === 'dark'
+                    ? 'bg-slate-900/60 border-slate-800/80'
+                    : 'bg-white/70 border-white/60 shadow-xs'
                 }`}
               >
                 <div className="flex items-center justify-between text-xs text-slate-400 font-semibold mb-2">
-                  <span>Active Bill</span>
+                  <span>Current Bill</span>
                   <Receipt className="w-4 h-4 text-emerald-500" />
                 </div>
                 <div className="text-2xl font-extrabold font-mono text-emerald-500">
                   {formatRupee(dashboardStats.activeAmount)}
                 </div>
-                <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 truncate">
-                  {occasionName.trim() || 'No active dinner'} ({participantsCountInput || 0} people)
+                <p className="text-xs text-slate-400 mt-1 truncate">
+                  {occasionName.trim() || 'No active bill'}
                 </p>
               </div>
 
-              {/* Card 2: Collected vs Pending */}
               <div
-                className={`p-5 rounded-2xl border shadow-xs transition-colors ${
-                  theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'
+                className={`p-5 rounded-3xl border backdrop-blur-xl transition-all ${
+                  theme === 'dark'
+                    ? 'bg-slate-900/60 border-slate-800/80'
+                    : 'bg-white/70 border-white/60 shadow-xs'
                 }`}
               >
                 <div className="flex items-center justify-between text-xs text-slate-400 font-semibold mb-2">
@@ -993,54 +1739,58 @@ export default function App() {
                 <div className="text-2xl font-extrabold font-mono text-emerald-600 dark:text-emerald-400">
                   {formatRupee(dashboardStats.activeCollected)}
                 </div>
-                <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+                <p className="text-xs text-slate-400 mt-1">
                   Pending: <span className="font-semibold text-amber-500">{formatRupee(dashboardStats.activePending)}</span>
                 </p>
               </div>
 
-              {/* Card 3: Tracked Splits */}
               <div
-                className={`p-5 rounded-2xl border shadow-xs transition-colors ${
-                  theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'
+                className={`p-5 rounded-3xl border backdrop-blur-xl transition-all ${
+                  theme === 'dark'
+                    ? 'bg-slate-900/60 border-slate-800/80'
+                    : 'bg-white/70 border-white/60 shadow-xs'
                 }`}
               >
                 <div className="flex items-center justify-between text-xs text-slate-400 font-semibold mb-2">
-                  <span>Tracked Splits</span>
-                  <BookmarkCheck className="w-4 h-4 text-blue-500" />
+                  <span>Tracked Records</span>
+                  <BookmarkCheck className="w-4 h-4 text-emerald-500" />
                 </div>
                 <div className="text-2xl font-extrabold font-mono">
                   {dashboardStats.historyCount}
                 </div>
-                <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-                  {dashboardStats.fullySettledCount} completely settled
+                <p className="text-xs text-slate-400 mt-1">
+                  {dashboardStats.fullySettledCount} completed
                 </p>
               </div>
 
-              {/* Card 4: Total Tracked Amount */}
               <div
-                className={`p-5 rounded-2xl border shadow-xs transition-colors ${
-                  theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'
+                className={`p-5 rounded-3xl border backdrop-blur-xl transition-all ${
+                  theme === 'dark'
+                    ? 'bg-slate-900/60 border-slate-800/80'
+                    : 'bg-white/70 border-white/60 shadow-xs'
                 }`}
               >
                 <div className="flex items-center justify-between text-xs text-slate-400 font-semibold mb-2">
                   <span>Lifetime Tracked</span>
-                  <CircleDollarSign className="w-4 h-4 text-amber-500" />
+                  <CircleDollarSign className="w-4 h-4 text-emerald-500" />
                 </div>
-                <div className="text-2xl font-extrabold font-mono text-amber-500">
+                <div className="text-2xl font-extrabold font-mono text-emerald-500">
                   {formatRupee(dashboardStats.totalHistoryAmount)}
                 </div>
-                <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-                  Across all saved dinner events
+                <p className="text-xs text-slate-400 mt-1">
+                  Across all occasions
                 </p>
               </div>
             </div>
 
-            {/* Quick Actions & Recent History Grid */}
+            {/* Quick Widgets */}
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-              {/* Active Bill Quick Widget */}
+              {/* Active Bill Preview */}
               <div
-                className={`lg:col-span-6 p-6 rounded-2xl border shadow-sm transition-colors ${
-                  theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'
+                className={`lg:col-span-6 p-6 rounded-3xl border backdrop-blur-xl transition-all ${
+                  theme === 'dark'
+                    ? 'bg-slate-900/60 border-slate-800/80'
+                    : 'bg-white/70 border-white/60 shadow-xs'
                 }`}
               >
                 <div className="flex items-center justify-between mb-4">
@@ -1053,7 +1803,7 @@ export default function App() {
                     onClick={() => setActiveTab('splitter')}
                     className="text-xs font-bold text-emerald-500 hover:underline flex items-center gap-1 cursor-pointer"
                   >
-                    <span>Edit Bill</span>
+                    <span>View Full Details</span>
                     <ArrowRight className="w-3.5 h-3.5" />
                   </button>
                 </div>
@@ -1061,36 +1811,37 @@ export default function App() {
                 {!isInvalid && shareCalculation ? (
                   <div className="space-y-4">
                     <div
-                      className={`p-4 rounded-xl border flex items-center justify-between ${
-                        theme === 'dark' ? 'bg-slate-800/60 border-slate-700' : 'bg-slate-50 border-slate-200'
+                      className={`p-4 rounded-2xl border flex items-center justify-between ${
+                        theme === 'dark'
+                          ? 'bg-slate-800/50 border-slate-700/60'
+                          : 'bg-white/80 border-slate-200/70'
                       }`}
                     >
                       <div>
-                        <p className="text-xs text-slate-400 font-medium">Event Name</p>
-                        <p className="text-base font-bold truncate max-w-[220px]">
+                        <p className="text-xs text-slate-400">Occasion</p>
+                        <p className="text-base font-bold truncate max-w-[200px]">
                           {occasionName.trim() || 'Dinner'}
                         </p>
-                        <p className="text-xs text-slate-500 mt-0.5">
-                          {shareCalculation.count} participants added
+                        <p className="text-xs text-slate-400 mt-0.5">
+                          {shareCalculation.count} participants
                         </p>
                       </div>
                       <div className="text-right">
-                        <p className="text-xs text-slate-400 font-medium">Total Bill</p>
+                        <p className="text-xs text-slate-400">Total</p>
                         <p className="text-xl font-extrabold font-mono text-emerald-500">
                           {formatRupee(shareCalculation.totalBill)}
                         </p>
                       </div>
                     </div>
 
-                    {/* Collection Status */}
                     <div>
                       <div className="flex items-center justify-between text-xs font-semibold mb-1.5">
-                        <span>Paid Status:</span>
+                        <span>Collection Status:</span>
                         <span className="text-emerald-500">
                           {shareCalculation.paidCount} of {shareCalculation.count} paid ({shareCalculation.progressPercent}%)
                         </span>
                       </div>
-                      <div className="w-full bg-slate-200 dark:bg-slate-700 h-2.5 rounded-full overflow-hidden">
+                      <div className="w-full bg-slate-200 dark:bg-slate-800 h-2.5 rounded-full overflow-hidden">
                         <div
                           className="bg-emerald-500 h-full rounded-full transition-all duration-300"
                           style={{ width: `${shareCalculation.progressPercent}%` }}
@@ -1098,26 +1849,26 @@ export default function App() {
                       </div>
                     </div>
 
-                    <div className="flex items-center gap-2 pt-2">
+                    <div className="flex flex-wrap items-center gap-2 pt-2">
                       <button
                         type="button"
                         onClick={handleSaveToHistory}
-                        className="flex-1 py-2 px-3 rounded-xl bg-slate-900 dark:bg-emerald-500 text-white dark:text-slate-950 font-bold text-xs flex items-center justify-center gap-1.5 transition cursor-pointer"
+                        className="flex-1 py-2 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs flex items-center justify-center gap-1.5 transition cursor-pointer"
                       >
                         <BookmarkCheck className="w-3.5 h-3.5" />
-                        <span>Save to History</span>
+                        <span>Save</span>
                       </button>
                       <button
                         type="button"
-                        onClick={handleCopySummary}
+                        onClick={() => setShowDownloadModal(true)}
                         className={`py-2 px-3 rounded-xl border text-xs font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer ${
                           theme === 'dark'
-                            ? 'border-slate-700 hover:bg-slate-800 text-slate-200'
-                            : 'border-slate-300 hover:bg-slate-50 text-slate-700'
+                            ? 'border-slate-800 hover:bg-slate-800 text-slate-300'
+                            : 'border-slate-200 hover:bg-slate-100 text-slate-700'
                         }`}
                       >
-                        <Copy className="w-3.5 h-3.5" />
-                        <span>Copy Summary</span>
+                        <Download className="w-3.5 h-3.5" />
+                        <span>Export</span>
                       </button>
                     </div>
                   </div>
@@ -1127,31 +1878,33 @@ export default function App() {
                     <button
                       type="button"
                       onClick={() => setActiveTab('splitter')}
-                      className="px-4 py-2 rounded-xl bg-slate-900 dark:bg-emerald-500 text-white dark:text-slate-950 font-bold text-xs cursor-pointer"
+                      className="px-4 py-2 rounded-xl bg-emerald-600 text-white font-bold text-xs cursor-pointer"
                     >
-                      Start New Split
+                      Start New Calculation
                     </button>
                   </div>
                 )}
               </div>
 
-              {/* Recent History Preview Widget */}
+              {/* Recent History */}
               <div
-                className={`lg:col-span-6 p-6 rounded-2xl border shadow-sm transition-colors ${
-                  theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'
+                className={`lg:col-span-6 p-6 rounded-3xl border backdrop-blur-xl transition-all ${
+                  theme === 'dark'
+                    ? 'bg-slate-900/60 border-slate-800/80'
+                    : 'bg-white/70 border-white/60 shadow-xs'
                 }`}
               >
                 <div className="flex items-center justify-between mb-4">
                   <h3 className="font-bold text-base flex items-center gap-2">
                     <HistoryIcon className="w-4 h-4 text-emerald-500" />
-                    Recent Split History
+                    Recent History
                   </h3>
                   <button
                     type="button"
                     onClick={() => setActiveTab('history')}
                     className="text-xs font-bold text-emerald-500 hover:underline flex items-center gap-1 cursor-pointer"
                   >
-                    <span>View All ({historyList.length})</span>
+                    <span>All ({historyList.length})</span>
                     <ArrowRight className="w-3.5 h-3.5" />
                   </button>
                 </div>
@@ -1161,10 +1914,10 @@ export default function App() {
                     <div
                       key={item.id}
                       onClick={() => handleRestoreHistoryItem(item)}
-                      className={`p-3.5 rounded-xl border transition flex items-center justify-between cursor-pointer ${
+                      className={`p-3.5 rounded-2xl border transition flex items-center justify-between cursor-pointer ${
                         theme === 'dark'
-                          ? 'bg-slate-800/60 border-slate-700/80 hover:border-slate-600'
-                          : 'bg-white border-slate-200 hover:border-slate-300'
+                          ? 'bg-slate-800/40 border-slate-800 hover:border-slate-700'
+                          : 'bg-white/60 border-slate-200/80 hover:border-slate-300'
                       }`}
                     >
                       <div>
@@ -1182,11 +1935,11 @@ export default function App() {
                         <span
                           className={`text-[10px] font-bold px-1.5 py-0.2 rounded-full ${
                             item.isFullySettled
-                              ? 'bg-emerald-500/20 text-emerald-600 dark:text-emerald-400'
-                              : 'bg-amber-500/20 text-amber-600 dark:text-amber-400'
+                              ? 'bg-emerald-500/20 text-emerald-500'
+                              : 'bg-amber-500/20 text-amber-500'
                           }`}
                         >
-                          {item.isFullySettled ? 'Settled ✓' : 'Pending'}
+                          {item.isFullySettled ? 'Settled' : 'Pending'}
                         </span>
                       </div>
                     </div>
@@ -1198,45 +1951,37 @@ export default function App() {
         )}
 
         {/* ============================================================== */}
-        {/* VIEW 2: ACTIVE SPLITTER (The Full Precision Splitter Engine)   */}
+        {/* VIEW 2: SPLITTER (Precision Calculator & UPI QR Codes)         */}
         {/* ============================================================== */}
         {activeTab === 'splitter' && (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 lg:gap-8 items-start animate-fade-in">
-            {/* LEFT COLUMN: Input Form */}
+            {/* Input Form Card */}
             <div className="lg:col-span-5 space-y-6">
               <div
-                className={`rounded-2xl border p-5 sm:p-6 shadow-sm transition-colors duration-200 ${
-                  theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'
+                className={`rounded-3xl border p-5 sm:p-6 backdrop-blur-xl shadow-lg transition-all ${
+                  theme === 'dark'
+                    ? 'bg-slate-900/60 border-slate-800/80 shadow-black/20'
+                    : 'bg-white/70 border-white/60 shadow-slate-200/50'
                 }`}
               >
                 <div className="flex items-center justify-between mb-5">
-                  <h2
-                    className={`text-base font-bold flex items-center gap-2 ${
-                      theme === 'dark' ? 'text-white' : 'text-slate-900'
-                    }`}
-                  >
+                  <h2 className="text-base font-bold flex items-center gap-2">
                     <Receipt className="w-4 h-4 text-emerald-500" />
-                    Bill & Participant Details
+                    Bill Specifications
                   </h2>
-                  <span
-                    className={`text-xs font-semibold px-2 py-0.5 rounded ${
-                      theme === 'dark' ? 'bg-slate-800 text-slate-300' : 'bg-slate-100 text-slate-700'
-                    }`}
-                  >
-                    Currency: INR (₹)
+                  <span className="text-[11px] font-bold px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 font-mono">
+                    INR (₹)
                   </span>
                 </div>
 
                 <div className="space-y-4">
-                  {/* 1. Occasion Name */}
+                  {/* Occasion */}
                   <div>
                     <label
                       htmlFor="occasion"
-                      className={`block text-xs font-bold uppercase tracking-wider mb-1.5 ${
-                        theme === 'dark' ? 'text-slate-300' : 'text-slate-600'
-                      }`}
+                      className="block text-xs font-bold uppercase tracking-wider text-slate-400 mb-1.5"
                     >
-                      1. Occasion Name
+                      Occasion / Merchant
                     </label>
                     <div className="relative">
                       <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-slate-400">
@@ -1245,37 +1990,31 @@ export default function App() {
                       <input
                         id="occasion"
                         type="text"
-                        placeholder="e.g. Dinner with Friends, Cafe Chill..."
+                        placeholder="e.g. Dinner with Friends"
                         value={occasionName}
                         onChange={(e) => setOccasionName(e.target.value)}
-                        className={`w-full pl-10 pr-3.5 py-2.5 border rounded-xl text-sm font-medium placeholder:text-slate-400 focus:outline-none focus:ring-2 transition ${
+                        className={`w-full pl-10 pr-3.5 py-2.5 border rounded-2xl text-sm font-medium focus:outline-none focus:ring-2 focus:ring-emerald-500 transition ${
                           theme === 'dark'
-                            ? 'bg-slate-800 border-slate-700 text-white focus:ring-emerald-500 focus:border-emerald-500'
-                            : 'bg-white border-slate-300 text-slate-900 focus:ring-slate-900 focus:border-slate-900'
+                            ? 'bg-slate-800/60 border-slate-700/70 text-white placeholder:text-slate-500'
+                            : 'bg-white/80 border-slate-200 text-slate-900 placeholder:text-slate-400'
                         }`}
                       />
                     </div>
                   </div>
 
-                  {/* 2. Bill Amount in Rupees */}
+                  {/* Bill Amount */}
                   <div>
                     <div className="flex items-center justify-between mb-1.5">
                       <label
                         htmlFor="billAmount"
-                        className={`block text-xs font-bold uppercase tracking-wider ${
-                          theme === 'dark' ? 'text-slate-300' : 'text-slate-600'
-                        }`}
+                        className="block text-xs font-bold uppercase tracking-wider text-slate-400"
                       >
-                        2. Bill Amount (in ₹)
+                        Total Bill Amount (₹)
                       </label>
-                      <span className="text-xs text-slate-400">Required</span>
+                      <span className="text-xs text-slate-400">Exact amount</span>
                     </div>
                     <div className="relative">
-                      <div
-                        className={`absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none font-bold text-base ${
-                          theme === 'dark' ? 'text-emerald-400' : 'text-slate-700'
-                        }`}
-                      >
+                      <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none font-bold text-base text-emerald-500">
                         ₹
                       </div>
                       <input
@@ -1286,35 +2025,31 @@ export default function App() {
                         placeholder="0.00"
                         value={billAmountInput}
                         onChange={(e) => setBillAmountInput(e.target.value)}
-                        className={`w-full pl-9 pr-3.5 py-2.5 border rounded-xl text-base font-semibold placeholder:text-slate-400 focus:outline-none focus:ring-2 transition ${
+                        className={`w-full pl-9 pr-3.5 py-2.5 border rounded-2xl text-base font-semibold focus:outline-none focus:ring-2 focus:ring-emerald-500 transition ${
                           isBillInvalid && billAmountInput !== ''
                             ? 'border-red-400 focus:ring-red-400'
                             : theme === 'dark'
-                            ? 'bg-slate-800 border-slate-700 text-white focus:ring-emerald-500 focus:border-emerald-500'
-                            : 'bg-white border-slate-300 text-slate-900 focus:ring-slate-900 focus:border-slate-900'
+                            ? 'bg-slate-800/60 border-slate-700/70 text-white placeholder:text-slate-500'
+                            : 'bg-white/80 border-slate-200 text-slate-900 placeholder:text-slate-400'
                         }`}
                       />
                     </div>
                     {isBillInvalid && billAmountInput !== '' && (
                       <p className="text-xs text-red-500 font-medium mt-1 flex items-center gap-1">
                         <AlertCircle className="w-3.5 h-3.5" />
-                        Bill must be a positive number in ₹ greater than 0
+                        Amount must be a positive number greater than 0
                       </p>
                     )}
                   </div>
 
-                  {/* Optional Tip in Rupees */}
+                  {/* Tip / Surcharge */}
                   <div className="pt-1">
                     <div className="flex items-center justify-between mb-1.5">
-                      <span
-                        className={`text-xs font-bold uppercase tracking-wider ${
-                          theme === 'dark' ? 'text-slate-400' : 'text-slate-500'
-                        }`}
-                      >
-                        Tip / Extra Charges (Optional)
+                      <span className="text-xs font-bold uppercase tracking-wider text-slate-400">
+                        Tip / Gratuity (Optional)
                       </span>
                       {tipAmount > 0 && (
-                        <span className="text-xs font-semibold text-emerald-400 bg-emerald-950/40 border border-emerald-800/40 px-2 py-0.5 rounded">
+                        <span className="text-xs font-bold text-emerald-500 font-mono">
                           +{formatRupee(tipAmount)}
                         </span>
                       )}
@@ -1328,14 +2063,12 @@ export default function App() {
                             setTipPercent(pct);
                             setCustomTipInput('');
                           }}
-                          className={`py-1.5 text-xs font-semibold rounded-lg border transition cursor-pointer ${
+                          className={`py-1.5 text-xs font-semibold rounded-xl border transition cursor-pointer ${
                             tipPercent === pct && customTipInput === ''
-                              ? theme === 'dark'
-                                ? 'bg-emerald-500 text-slate-950 border-emerald-500 font-bold'
-                                : 'bg-slate-900 text-white border-slate-900 shadow-xs'
+                              ? 'bg-emerald-600 text-white border-emerald-600 shadow-xs font-bold'
                               : theme === 'dark'
-                              ? 'bg-slate-800 text-slate-300 border-slate-700 hover:bg-slate-750'
-                              : 'bg-white text-slate-700 border-slate-200 hover:border-slate-300 hover:bg-slate-50'
+                              ? 'bg-slate-800/50 text-slate-300 border-slate-700/70 hover:bg-slate-800'
+                              : 'bg-white/60 text-slate-700 border-slate-200 hover:bg-white'
                           }`}
                         >
                           {pct === 0 ? 'None' : `${pct}%`}
@@ -1344,18 +2077,16 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* 3. Number of Participants */}
+                  {/* Participants */}
                   <div className="pt-2">
                     <div className="flex items-center justify-between mb-1.5">
                       <label
                         htmlFor="participantsCount"
-                        className={`block text-xs font-bold uppercase tracking-wider ${
-                          theme === 'dark' ? 'text-slate-300' : 'text-slate-600'
-                        }`}
+                        className="block text-xs font-bold uppercase tracking-wider text-slate-400"
                       >
-                        3. Number of Participants
+                        Number of Participants
                       </label>
-                      <span className="text-xs text-slate-400">Min 1 person</span>
+                      <span className="text-xs text-slate-400">Min 1</span>
                     </div>
 
                     <div className="flex items-center gap-2">
@@ -1367,10 +2098,10 @@ export default function App() {
                             setParticipantsCountInput(String(current - 1));
                           }
                         }}
-                        className={`w-10 h-10 rounded-xl border flex items-center justify-center font-bold text-lg transition cursor-pointer ${
+                        className={`w-10 h-10 rounded-2xl border flex items-center justify-center font-bold text-lg transition cursor-pointer ${
                           theme === 'dark'
-                            ? 'border-slate-700 bg-slate-800 hover:bg-slate-700 text-white'
-                            : 'border-slate-300 bg-white hover:bg-slate-50 text-slate-700'
+                            ? 'border-slate-700 bg-slate-800/80 hover:bg-slate-700 text-white'
+                            : 'border-slate-300 bg-white/80 hover:bg-white text-slate-700'
                         }`}
                       >
                         −
@@ -1387,12 +2118,12 @@ export default function App() {
                           placeholder="e.g. 4"
                           value={participantsCountInput}
                           onChange={(e) => setParticipantsCountInput(e.target.value)}
-                          className={`w-full pl-9 pr-3 py-2.5 border rounded-xl text-center text-base font-semibold focus:outline-none focus:ring-2 transition ${
+                          className={`w-full pl-9 pr-3 py-2.5 border rounded-2xl text-center text-base font-semibold focus:outline-none focus:ring-2 focus:ring-emerald-500 transition ${
                             isCountInvalid && participantsCountInput !== ''
                               ? 'border-red-400 focus:ring-red-400'
                               : theme === 'dark'
-                              ? 'bg-slate-800 border-slate-700 text-white focus:ring-emerald-500 focus:border-emerald-500'
-                              : 'bg-white border-slate-300 text-slate-900 focus:ring-slate-900 focus:border-slate-900'
+                              ? 'bg-slate-800/60 border-slate-700/70 text-white'
+                              : 'bg-white/80 border-slate-200 text-slate-900'
                           }`}
                         />
                       </div>
@@ -1402,10 +2133,10 @@ export default function App() {
                           const current = parseInt(participantsCountInput || '0', 10);
                           setParticipantsCountInput(String(Math.max(1, current + 1)));
                         }}
-                        className={`w-10 h-10 rounded-xl border flex items-center justify-center font-bold text-lg transition cursor-pointer ${
+                        className={`w-10 h-10 rounded-2xl border flex items-center justify-center font-bold text-lg transition cursor-pointer ${
                           theme === 'dark'
-                            ? 'border-slate-700 bg-slate-800 hover:bg-slate-700 text-white'
-                            : 'border-slate-300 bg-white hover:bg-slate-50 text-slate-700'
+                            ? 'border-slate-700 bg-slate-800/80 hover:bg-slate-700 text-white'
+                            : 'border-slate-300 bg-white/80 hover:bg-white text-slate-700'
                         }`}
                       >
                         +
@@ -1419,7 +2150,7 @@ export default function App() {
                       </p>
                     )}
 
-                    {/* Quick Select Chips */}
+                    {/* Quick Stepper Chips */}
                     <div className="flex items-center gap-1.5 mt-2.5">
                       <span className="text-xs text-slate-400">Quick:</span>
                       {[2, 3, 4, 5, 6, 8].map((num) => (
@@ -1427,14 +2158,12 @@ export default function App() {
                           key={num}
                           type="button"
                           onClick={() => setParticipantsCountInput(String(num))}
-                          className={`text-xs px-2.5 py-1 rounded-md border font-medium transition cursor-pointer ${
+                          className={`text-xs px-2.5 py-1 rounded-xl border font-medium transition cursor-pointer ${
                             rawCount === num
-                              ? theme === 'dark'
-                                ? 'bg-emerald-500 text-slate-950 border-emerald-500 font-bold'
-                                : 'bg-slate-900 text-white border-slate-900'
+                              ? 'bg-emerald-600 text-white border-emerald-600 font-bold'
                               : theme === 'dark'
-                              ? 'bg-slate-800 text-slate-300 border-slate-700 hover:bg-slate-700'
-                              : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
+                              ? 'bg-slate-800/40 text-slate-300 border-slate-700/60 hover:bg-slate-800'
+                              : 'bg-white/60 text-slate-600 border-slate-200 hover:bg-white'
                           }`}
                         >
                           {num}
@@ -1443,11 +2172,11 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* Edit Participant Names */}
+                  {/* Names customization */}
                   {!isCountInvalid && rawCount > 0 && rawCount <= 12 && (
-                    <div className={`pt-2 border-t ${theme === 'dark' ? 'border-slate-800' : 'border-slate-100'}`}>
-                      <p className={`text-xs font-semibold mb-2 ${theme === 'dark' ? 'text-slate-400' : 'text-slate-600'}`}>
-                        Participant Names (Optional):
+                    <div className="pt-2 border-t border-slate-200/60 dark:border-slate-800/80">
+                      <p className="text-xs font-semibold text-slate-400 mb-2">
+                        Participant Names:
                       </p>
                       <div className="grid grid-cols-2 gap-2">
                         {Array.from({ length: rawCount }).map((_, idx) => (
@@ -1462,10 +2191,10 @@ export default function App() {
                                 [idx]: e.target.value,
                               }))
                             }
-                            className={`px-2.5 py-1.5 text-xs border rounded-lg focus:outline-none focus:ring-1 ${
+                            className={`px-3 py-1.5 text-xs border rounded-xl focus:outline-none focus:ring-1 focus:ring-emerald-500 ${
                               theme === 'dark'
-                                ? 'bg-slate-800 border-slate-700 text-slate-100 focus:ring-emerald-500'
-                                : 'bg-slate-50 border-slate-200 text-slate-800 focus:bg-white focus:ring-slate-900'
+                                ? 'bg-slate-800/60 border-slate-700/60 text-slate-100'
+                                : 'bg-white/80 border-slate-200 text-slate-800'
                             }`}
                           />
                         ))}
@@ -1473,169 +2202,128 @@ export default function App() {
                     </div>
                   )}
 
-                  {/* 'SPLIT EXPENSE' OPTION BUTTON */}
+                  {/* Primary Trigger */}
                   <div className="pt-3">
                     <button
                       type="button"
                       onClick={handleSplitExpense}
-                      className={`w-full py-3.5 px-4 rounded-xl font-bold text-sm sm:text-base flex items-center justify-center gap-2.5 shadow-md hover:shadow-lg transition-all transform active:scale-[0.99] cursor-pointer ${
-                        theme === 'dark'
-                          ? 'bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-extrabold'
-                          : 'bg-slate-900 hover:bg-slate-800 text-white'
-                      }`}
+                      className="w-full py-3.5 px-4 rounded-2xl font-bold text-sm sm:text-base flex items-center justify-center gap-2 bg-gradient-to-r from-emerald-600 to-teal-500 hover:from-emerald-500 hover:to-teal-400 text-white shadow-md shadow-emerald-600/20 active:scale-[0.99] transition cursor-pointer"
                     >
-                      <Split className={`w-5 h-5 ${theme === 'dark' ? 'text-slate-950' : 'text-emerald-400'}`} />
+                      <Split className="w-5 h-5" />
                       <span>Split Expense</span>
-                      <ArrowDown className="w-4 h-4 ml-1 hidden sm:inline" />
                     </button>
-                    <p className="text-[11px] text-center text-slate-400 mt-1.5">
-                      Directly reveals the exact Rupee split for each participant added
-                    </p>
                   </div>
                 </div>
               </div>
-
-              {/* Quick Summary Pill in Rupees */}
-              {!isInvalid && shareCalculation && (
-                <div
-                  className={`border rounded-2xl p-5 shadow-xs flex items-center justify-between transition-colors ${
-                    theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'
-                  }`}
-                >
-                  <div>
-                    <p className="text-xs font-medium text-slate-400">Occasion</p>
-                    <p className={`text-sm font-bold truncate max-w-[180px] ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>
-                      {occasionName.trim() || 'Dinner'}
-                    </p>
-                  </div>
-                  <div className="text-right">
-                    <p className="text-xs font-medium text-slate-400">Total in Rupees</p>
-                    <p className="text-lg font-extrabold font-mono text-emerald-500">
-                      {formatRupee(shareCalculation.totalBill)}
-                    </p>
-                  </div>
-                </div>
-              )}
             </div>
 
-            {/* RIGHT COLUMN: Results, Real Split Display, Mark as Paid & Save to History */}
+            {/* Results & UPI Settlement Column */}
             <div ref={resultsRef} className="lg:col-span-7 space-y-6 scroll-mt-20">
-              
-              {/* CORE FEATURE 4: Show "no result" if bill or no of people is empty, zero or negative */}
               {isInvalid || !hasSplitSubmitted ? (
                 <div
-                  className={`rounded-2xl border-2 border-dashed p-8 sm:p-12 text-center shadow-xs transition-colors ${
+                  className={`rounded-3xl border-2 border-dashed p-10 text-center backdrop-blur-xl transition-all ${
                     theme === 'dark'
-                      ? 'bg-slate-900/50 border-slate-800 text-slate-300'
-                      : 'bg-white border-slate-300 text-slate-600'
+                      ? 'bg-slate-900/40 border-slate-800/80 text-slate-300'
+                      : 'bg-white/50 border-slate-300/80 text-slate-600'
                   }`}
                 >
-                  <div
-                    className={`w-16 h-16 mx-auto rounded-2xl border flex items-center justify-center mb-4 ${
-                      theme === 'dark'
-                        ? 'bg-slate-800 border-slate-700 text-slate-400'
-                        : 'bg-slate-100 border-slate-200 text-slate-400'
-                    }`}
-                  >
+                  <div className="w-16 h-16 mx-auto rounded-2xl bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-emerald-500 mb-4">
                     <AlertCircle className="w-8 h-8" />
                   </div>
-                  <h3 className={`text-xl font-bold mb-2 tracking-tight ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>
-                    no result
-                  </h3>
-                  <p className="text-sm text-slate-400 max-w-md mx-auto leading-relaxed mb-6">
+                  <h3 className="text-xl font-bold mb-2 tracking-tight">no result</h3>
+                  <p className="text-xs sm:text-sm text-slate-400 max-w-md mx-auto leading-relaxed mb-6">
                     {isBillInvalid && isCountInvalid
                       ? 'Please enter a valid bill amount greater than ₹0.00 and at least 1 participant, then click Split Expense.'
                       : isBillInvalid
-                      ? 'The bill amount is empty, zero, or negative. Please enter a valid positive amount in Rupees (₹).'
+                      ? 'The bill amount is empty, zero, or negative. Please enter a valid positive bill amount.'
                       : isCountInvalid
                       ? 'The number of participants is empty, zero, or negative. Please specify at least 1 person.'
-                      : 'Click the "Split Expense" button to calculate the real split among participants.'}
+                      : 'Click the "Split Expense" button to calculate the shares.'}
                   </p>
-
-                  <div
-                    className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-lg border text-xs font-medium ${
-                      theme === 'dark'
-                        ? 'bg-slate-800 border-slate-700 text-slate-300'
-                        : 'bg-slate-50 border-slate-200 text-slate-600'
-                    }`}
-                  >
-                    <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
-                    Auto-saved: Refreshing or reloading the page will never lose your calculation
-                  </div>
                 </div>
               ) : (
                 shareCalculation && (
                   <>
-                    {/* REAL SPLIT DISPLAY WITH MENTIONED AMOUNT & MARK AS PAID */}
+                    {/* Real Split Card */}
                     <div
-                      className={`rounded-2xl border p-5 sm:p-6 shadow-sm transition-colors duration-200 ${
-                        theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'
+                      className={`rounded-3xl border p-5 sm:p-6 backdrop-blur-xl shadow-lg transition-all ${
+                        theme === 'dark'
+                          ? 'bg-slate-900/60 border-slate-800/80 shadow-black/20'
+                          : 'bg-white/70 border-white/60 shadow-slate-200/50'
                       }`}
                     >
-                      <div
-                        className={`flex flex-col sm:flex-row sm:items-center justify-between pb-5 border-b gap-3 ${
-                          theme === 'dark' ? 'border-slate-800' : 'border-slate-100'
-                        }`}
-                      >
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between pb-5 border-b border-slate-200/60 dark:border-slate-800/80 gap-3">
                         <div>
                           <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 text-xs font-semibold mb-1">
                             <CheckCircle2 className="w-3.5 h-3.5" />
-                            Real Split Calculated
+                            Exact Shares Computed
                           </span>
-                          <h2 className={`text-xl font-bold tracking-tight ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>
-                            {occasionName.trim() || 'Dinner'} Split ({shareCalculation.count} Participants)
+                          <h2 className="text-xl font-bold tracking-tight">
+                            {occasionName.trim() || 'Dinner'} Split ({shareCalculation.count} Persons)
                           </h2>
                         </div>
 
                         <div className="flex flex-wrap items-center gap-2">
-                          {/* SAVE TO HISTORY BUTTON */}
                           <button
                             type="button"
                             onClick={handleSaveToHistory}
-                            title="Save this split to history for future tracking"
-                            className="px-3 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold flex items-center gap-1.5 shadow-xs transition cursor-pointer"
+                            className="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold flex items-center gap-1.5 shadow-xs transition cursor-pointer"
                           >
                             <BookmarkCheck className="w-3.5 h-3.5" />
-                            <span>Save to History</span>
+                            <span>Save</span>
                           </button>
 
-                          {/* COPY SUMMARY BUTTON */}
+                          <button
+                            type="button"
+                            onClick={() => setShowDownloadModal(true)}
+                            className={`px-3.5 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer border ${
+                              theme === 'dark'
+                                ? 'border-slate-700 bg-slate-800/60 text-white hover:bg-slate-800'
+                                : 'border-slate-200 bg-white text-slate-800 hover:bg-slate-50'
+                            }`}
+                          >
+                            <Download className="w-3.5 h-3.5 text-emerald-500" />
+                            <span>Export</span>
+                          </button>
+
                           <button
                             type="button"
                             onClick={handleCopySummary}
-                            className={`px-3 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 shadow-xs transition cursor-pointer ${
+                            className={`px-3.5 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer border ${
                               theme === 'dark'
-                                ? 'bg-slate-800 hover:bg-slate-700 text-white border border-slate-700'
-                                : 'bg-slate-900 text-white hover:bg-slate-800'
+                                ? 'border-slate-700 bg-slate-800/60 text-white hover:bg-slate-800'
+                                : 'border-slate-200 bg-white text-slate-800 hover:bg-slate-50'
                             }`}
                           >
                             {copied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-                            <span>{copied ? 'Copied!' : 'Copy Summary'}</span>
+                            <span>{copied ? 'Copied' : 'Copy'}</span>
                           </button>
                         </div>
                       </div>
 
-                      {/* Settlement Progress Bar (Mark as Paid tracker) */}
+                      {/* Collection Progress Tracker */}
                       <div
-                        className={`mt-5 p-4 rounded-xl border ${
-                          theme === 'dark' ? 'bg-slate-800/60 border-slate-700' : 'bg-slate-50 border-slate-200'
+                        className={`mt-5 p-4 rounded-2xl border ${
+                          theme === 'dark'
+                            ? 'bg-slate-800/40 border-slate-800/80'
+                            : 'bg-white/60 border-slate-200/70'
                         }`}
                       >
                         <div className="flex flex-col sm:flex-row sm:items-center justify-between text-xs font-medium mb-2 gap-1.5">
                           <div className="flex items-center gap-2">
                             <CircleDollarSign className="w-4 h-4 text-emerald-500 shrink-0" />
-                            <span className={theme === 'dark' ? 'text-slate-200 font-bold' : 'text-slate-800 font-bold'}>
-                              Collection Progress:
+                            <span className="font-bold">
+                              Collected:
                             </span>
-                            <span className="font-semibold text-emerald-600 dark:text-emerald-400">
-                              {shareCalculation.paidCount} of {shareCalculation.count} participants paid ({shareCalculation.progressPercent}%)
+                            <span className="font-semibold text-emerald-500">
+                              {shareCalculation.paidCount} of {shareCalculation.count} participants ({shareCalculation.progressPercent}%)
                             </span>
                           </div>
                           <div className="flex items-center gap-2">
                             <button
                               type="button"
                               onClick={() => handleMarkAllPaid(true)}
-                              className="text-[11px] font-semibold text-emerald-600 hover:underline cursor-pointer"
+                              className="text-[11px] font-semibold text-emerald-500 hover:underline cursor-pointer"
                             >
                               Mark All Paid
                             </button>
@@ -1643,63 +2331,53 @@ export default function App() {
                             <button
                               type="button"
                               onClick={() => handleMarkAllPaid(false)}
-                              className="text-[11px] font-semibold text-slate-500 hover:underline cursor-pointer"
+                              className="text-[11px] font-semibold text-slate-400 hover:underline cursor-pointer"
                             >
-                              Clear All Paid
+                              Clear
                             </button>
                           </div>
                         </div>
 
-                        {/* Progress Track */}
-                        <div className="w-full bg-slate-200 dark:bg-slate-700 h-2.5 rounded-full overflow-hidden mb-2">
+                        <div className="w-full bg-slate-200 dark:bg-slate-800 h-2.5 rounded-full overflow-hidden mb-2">
                           <div
                             className="bg-emerald-500 h-full rounded-full transition-all duration-300"
                             style={{ width: `${shareCalculation.progressPercent}%` }}
                           />
                         </div>
 
-                        <div className="flex items-center justify-between text-[11px] text-slate-500 dark:text-slate-400">
-                          <span>Collected: <strong className="text-emerald-600 dark:text-emerald-400 font-mono">{formatRupee(shareCalculation.paidAmount)}</strong></span>
+                        <div className="flex items-center justify-between text-[11px] text-slate-400">
+                          <span>Paid: <strong className="text-emerald-500 font-mono">{formatRupee(shareCalculation.paidAmount)}</strong></span>
                           <span>Pending: <strong className="font-mono text-amber-500">{formatRupee(Math.max(0, shareCalculation.totalBill - shareCalculation.paidAmount))}</strong></span>
                         </div>
                       </div>
 
-                      {/* Exact Rupee Verification Box */}
+                      {/* Exact Rupee Guarantee */}
                       <div
-                        className={`mt-4 p-4 rounded-xl border ${
-                          theme === 'dark' ? 'bg-slate-800/40 border-slate-700/80' : 'bg-slate-50 border-slate-200'
+                        className={`mt-4 p-4 rounded-2xl border ${
+                          theme === 'dark'
+                            ? 'bg-slate-800/30 border-slate-800/60'
+                            : 'bg-white/60 border-slate-200/60'
                         }`}
                       >
                         <div className="flex flex-col sm:flex-row sm:items-center justify-between text-xs font-medium mb-1.5 gap-1">
                           <span className="flex items-center gap-1.5">
                             <CheckCircle2 className="w-4 h-4 text-emerald-500 shrink-0" />
-                            <strong className={theme === 'dark' ? 'text-white' : 'text-slate-900'}>
-                              Exact Rupee & Paise Guarantee:
-                            </strong>
+                            <strong>Exact Paisa Balancing:</strong>
                           </span>
                           <span className="font-mono font-bold text-emerald-500 text-sm">
                             Sum of shares = {formatRupee(shareCalculation.calculatedSum)}
                           </span>
                         </div>
-                        <p className={`text-xs leading-relaxed ${theme === 'dark' ? 'text-slate-400' : 'text-slate-500'}`}>
-                          Total bill of{' '}
-                          <span className="font-semibold text-emerald-500">{formatRupee(shareCalculation.totalBill)}</span> is
-                          divided among{' '}
-                          <span className="font-semibold">{shareCalculation.count} participants</span>. All remainder paise
-                          are balanced so the shares match <strong>exactly to {formatRupee(shareCalculation.totalBill)} with zero difference</strong>.
+                        <p className="text-xs text-slate-400 leading-relaxed">
+                          Total bill of <span className="font-semibold text-emerald-500">{formatRupee(shareCalculation.totalBill)}</span> is balanced across {shareCalculation.count} participants with zero penny difference.
                         </p>
                       </div>
 
-                      {/* Real Split: Each Added Participant with their Exact Mentioned Amount & "Mark as Paid" option */}
+                      {/* Participant Shares Grid with UPI QR Buttons */}
                       <div className="mt-5">
-                        <div className="flex items-center justify-between mb-3">
-                          <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400">
-                            Individual Share for Each Participant ({shareCalculation.count} Added)
-                          </h4>
-                          <span className="text-[11px] text-slate-400">
-                            Toggle &apos;Mark as Paid&apos; when settled
-                          </span>
-                        </div>
+                        <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400 mb-3">
+                          Individual Shares & Instant UPI Settlement
+                        </h4>
 
                         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                           {shareCalculation.shares.map((person) => {
@@ -1707,25 +2385,23 @@ export default function App() {
                             return (
                               <div
                                 key={person.index}
-                                className={`p-3.5 rounded-xl border transition flex flex-col justify-between gap-3 shadow-2xs ${
+                                className={`p-4 rounded-2xl border transition-all flex flex-col justify-between gap-3 ${
                                   isPaid
                                     ? theme === 'dark'
-                                      ? 'bg-emerald-950/20 border-emerald-800/60'
-                                      : 'bg-emerald-50/60 border-emerald-200'
+                                      ? 'bg-emerald-950/20 border-emerald-800/40'
+                                      : 'bg-emerald-50/70 border-emerald-200/80'
                                     : theme === 'dark'
-                                    ? 'bg-slate-800/80 border-slate-700 hover:border-slate-600'
-                                    : 'bg-white border-slate-200 hover:border-slate-300'
+                                    ? 'bg-slate-800/50 border-slate-700/60 hover:border-slate-600'
+                                    : 'bg-white/80 border-slate-200/80 hover:border-slate-300'
                                 }`}
                               >
                                 <div className="flex items-center justify-between">
                                   <div className="flex items-center gap-2.5 min-w-0">
                                     <div
-                                      className={`w-8 h-8 rounded-full text-xs font-bold flex items-center justify-center shrink-0 ${
+                                      className={`w-9 h-9 rounded-xl text-xs font-bold flex items-center justify-center shrink-0 ${
                                         isPaid
                                           ? 'bg-emerald-500 text-slate-950'
-                                          : theme === 'dark'
-                                          ? 'bg-slate-700 text-white'
-                                          : 'bg-slate-900 text-white'
+                                          : 'bg-slate-900 dark:bg-slate-700 text-white'
                                       }`}
                                     >
                                       {isPaid ? <Check className="w-4 h-4" /> : person.name.charAt(0).toUpperCase()}
@@ -1735,15 +2411,13 @@ export default function App() {
                                         className={`text-sm font-bold leading-tight truncate ${
                                           isPaid
                                             ? 'text-emerald-700 dark:text-emerald-300 line-through decoration-emerald-500/50'
-                                            : theme === 'dark'
-                                            ? 'text-white'
-                                            : 'text-slate-900'
+                                            : ''
                                         }`}
                                       >
                                         {person.name}
                                       </p>
                                       <p className="text-[11px] text-slate-400">
-                                        {person.getsExtraPaise ? 'Share (+₹0.01 rounded)' : 'Equal share'}
+                                        {person.getsExtraPaise ? '+₹0.01 rounded' : 'Equal share'}
                                       </p>
                                     </div>
                                   </div>
@@ -1755,14 +2429,14 @@ export default function App() {
                                   </div>
                                 </div>
 
-                                {/* MARK AS PAID OPTION BUTTON */}
-                                <div className="pt-2 border-t border-slate-100 dark:border-slate-700/60 flex items-center justify-between">
+                                {/* Action Buttons: Mark as Paid & UPI QR */}
+                                <div className="pt-2 border-t border-slate-200/50 dark:border-slate-700/50 flex items-center gap-2">
                                   <button
                                     type="button"
                                     onClick={() => toggleMarkAsPaid(person.index)}
-                                    className={`w-full py-1.5 px-3 rounded-lg text-xs font-semibold flex items-center justify-center gap-2 transition cursor-pointer ${
+                                    className={`flex-1 py-1.5 px-2.5 rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer ${
                                       isPaid
-                                        ? 'bg-emerald-600 hover:bg-emerald-700 text-white shadow-xs'
+                                        ? 'bg-emerald-600 text-white'
                                         : theme === 'dark'
                                         ? 'bg-slate-700 hover:bg-slate-600 text-slate-200'
                                         : 'bg-slate-100 hover:bg-slate-200 text-slate-700'
@@ -1770,116 +2444,101 @@ export default function App() {
                                   >
                                     {isPaid ? (
                                       <>
-                                        <CheckSquare className="w-4 h-4 text-white" />
-                                        <span>Marked as Paid ✓</span>
+                                        <CheckSquare className="w-3.5 h-3.5" />
+                                        <span>Paid ✓</span>
                                       </>
                                     ) : (
                                       <>
-                                        <Square className="w-4 h-4 text-slate-400" />
-                                        <span>Mark as Paid</span>
+                                        <Square className="w-3.5 h-3.5 text-slate-400" />
+                                        <span>Mark Paid</span>
                                       </>
                                     )}
+                                  </button>
+
+                                  {/* UPI QR Code Generator Button */}
+                                  <button
+                                    type="button"
+                                    onClick={() => handleOpenUpiModal(person.name, person.share)}
+                                    title={`Generate UPI QR Code to pay ${person.name}`}
+                                    className="py-1.5 px-2.5 rounded-xl text-xs font-bold flex items-center justify-center gap-1 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20 hover:bg-emerald-500/20 transition cursor-pointer"
+                                  >
+                                    <QrCode className="w-3.5 h-3.5" />
+                                    <span>UPI QR</span>
                                   </button>
                                 </div>
                               </div>
                             );
                           })}
                         </div>
-
-                        {/* Total Verification Row */}
-                        <div
-                          className={`mt-4 pt-3 border-t flex items-center justify-between text-xs sm:text-sm ${
-                            theme === 'dark' ? 'border-slate-800' : 'border-slate-100'
-                          }`}
-                        >
-                          <span className={`font-bold ${theme === 'dark' ? 'text-slate-300' : 'text-slate-700'}`}>
-                            Total of All Shares:
-                          </span>
-                          <div className="flex items-center gap-2">
-                            <span className="text-xs font-semibold px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-600 dark:text-emerald-400">
-                              Exact Match ✓
-                            </span>
-                            <span className="font-mono font-extrabold text-base sm:text-lg text-emerald-500">
-                              {formatRupee(shareCalculation.calculatedSum)}
-                            </span>
-                          </div>
-                        </div>
                       </div>
                     </div>
 
-                    {/* CORE FEATURE 3: Button to show what each person paid */}
+                    {/* What Each Person Paid & Settlement Transfers Card */}
                     <div
-                      className={`rounded-2xl border p-5 sm:p-6 shadow-sm transition-colors duration-200 ${
-                        theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'
+                      className={`rounded-3xl border p-5 sm:p-6 backdrop-blur-xl shadow-lg transition-all ${
+                        theme === 'dark'
+                          ? 'bg-slate-900/60 border-slate-800/80 shadow-black/20'
+                          : 'bg-white/70 border-white/60 shadow-slate-200/50'
                       }`}
                     >
                       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                         <div>
-                          <h3 className={`text-base font-bold flex items-center gap-2 ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>
+                          <h3 className="text-base font-bold flex items-center gap-2">
                             <CreditCard className="w-4 h-4 text-emerald-500" />
-                            Payment & Settlement Details
+                            Settlement Ledger & UPI Transfers
                           </h3>
                           <p className="text-xs text-slate-400">
-                            See who paid what and calculate who owes whom in ₹
+                            Who covered the initial bill and direct UPI payment instructions
                           </p>
                         </div>
 
-                        {/* BUTTON TO SHOW WHAT EACH PERSON PAID */}
                         <button
                           type="button"
                           onClick={() => setShowPaidBreakdown((prev) => !prev)}
-                          className={`px-4 py-2 rounded-xl border font-semibold text-xs transition flex items-center justify-center gap-2 shadow-2xs cursor-pointer ${
+                          className={`px-4 py-2 rounded-2xl border font-semibold text-xs transition flex items-center justify-center gap-2 cursor-pointer ${
                             theme === 'dark'
-                              ? 'border-slate-700 hover:border-slate-600 bg-slate-800 text-slate-200'
-                              : 'border-slate-300 hover:border-slate-900 bg-white text-slate-800'
+                              ? 'border-slate-800 bg-slate-800/60 hover:bg-slate-800 text-slate-200'
+                              : 'border-slate-200 bg-white/80 hover:bg-white text-slate-800'
                           }`}
                         >
-                          <span>{showPaidBreakdown ? 'Hide Payment Breakdown' : 'Show What Each Person Paid'}</span>
+                          <span>{showPaidBreakdown ? 'Hide Breakdown' : 'Show What Each Person Paid'}</span>
                           {showPaidBreakdown ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
                         </button>
                       </div>
 
-                      {/* Breakdown section toggled by the button */}
                       {showPaidBreakdown && paymentBreakdown && (
-                        <div className={`mt-5 pt-5 border-t space-y-5 ${theme === 'dark' ? 'border-slate-800' : 'border-slate-100'}`}>
-                          
-                          {/* Who Paid Configuration */}
+                        <div className="mt-5 pt-5 border-t border-slate-200/60 dark:border-slate-800/80 space-y-5">
+                          {/* Payer Configuration */}
                           <div
-                            className={`rounded-xl p-4 border ${
-                              theme === 'dark' ? 'bg-slate-800/60 border-slate-700' : 'bg-slate-50 border-slate-200'
+                            className={`rounded-2xl p-4 border ${
+                              theme === 'dark'
+                                ? 'bg-slate-800/40 border-slate-800/80'
+                                : 'bg-white/60 border-slate-200/70'
                             }`}
                           >
                             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-3">
                               <span className="text-xs font-bold uppercase tracking-wider text-slate-400">
-                                Who Paid The Bill At The Restaurant?
+                                Who Paid At The Table?
                               </span>
                               <div className="flex items-center gap-2">
                                 <button
                                   type="button"
                                   onClick={() => setPayerMode('single')}
-                                  className={`text-xs px-2.5 py-1 rounded-lg font-medium transition cursor-pointer ${
+                                  className={`text-xs px-2.5 py-1 rounded-xl font-medium transition cursor-pointer ${
                                     payerMode === 'single'
-                                      ? theme === 'dark'
-                                        ? 'bg-emerald-500 text-slate-950 font-bold'
-                                        : 'bg-slate-900 text-white'
-                                      : theme === 'dark'
-                                      ? 'bg-slate-700 text-slate-300'
-                                      : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-100'
+                                      ? 'bg-emerald-600 text-white font-bold'
+                                      : 'text-slate-400 hover:text-slate-200'
                                   }`}
                                 >
-                                  One person paid all
+                                  One person paid
                                 </button>
                                 <button
                                   type="button"
                                   onClick={() => setPayerMode('custom')}
-                                  className={`text-xs px-2.5 py-1 rounded-lg font-medium transition cursor-pointer ${
+                                  className={`text-xs px-2.5 py-1 rounded-xl font-medium transition cursor-pointer ${
                                     payerMode === 'custom'
-                                      ? theme === 'dark'
-                                        ? 'bg-emerald-500 text-slate-950 font-bold'
-                                        : 'bg-slate-900 text-white'
-                                      : theme === 'dark'
-                                      ? 'bg-slate-700 text-slate-300'
-                                      : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-100'
+                                      ? 'bg-emerald-600 text-white font-bold'
+                                      : 'text-slate-400 hover:text-slate-200'
                                   }`}
                                 >
                                   Multiple paid
@@ -1894,12 +2553,12 @@ export default function App() {
                                     key={person.index}
                                     type="button"
                                     onClick={() => setSinglePayerIndex(person.index)}
-                                    className={`text-xs font-medium px-3 py-1.5 rounded-lg border transition cursor-pointer ${
+                                    className={`text-xs font-medium px-3 py-1.5 rounded-xl border transition cursor-pointer ${
                                       singlePayerIndex === person.index
-                                        ? 'bg-emerald-600 text-white border-emerald-600 shadow-2xs font-bold'
+                                        ? 'bg-emerald-600 text-white border-emerald-600 font-bold shadow-xs'
                                         : theme === 'dark'
-                                        ? 'bg-slate-700 text-slate-200 border-slate-600 hover:bg-slate-600'
-                                        : 'bg-white text-slate-700 border-slate-200 hover:border-slate-300'
+                                        ? 'bg-slate-800/60 text-slate-300 border-slate-700/60'
+                                        : 'bg-white text-slate-700 border-slate-200'
                                     }`}
                                   >
                                     {person.name} paid full ({formatRupee(shareCalculation.totalBill)})
@@ -1909,15 +2568,15 @@ export default function App() {
                             ) : (
                               <div className="space-y-2">
                                 <p className="text-xs text-slate-400">
-                                  Enter the amount in ₹ paid by each person at the counter:
+                                  Enter amount contributed by each person:
                                 </p>
                                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                                   {shareCalculation.shares.map((person) => (
                                     <div
                                       key={person.index}
-                                      className={`flex items-center justify-between gap-2 px-3 py-2 rounded-lg border ${
+                                      className={`flex items-center justify-between gap-2 px-3 py-2 rounded-xl border ${
                                         theme === 'dark'
-                                          ? 'bg-slate-800 border-slate-700'
+                                          ? 'bg-slate-800/60 border-slate-700/60'
                                           : 'bg-white border-slate-200'
                                       }`}
                                     >
@@ -1939,11 +2598,7 @@ export default function App() {
                                               [person.index]: e.target.value,
                                             }))
                                           }
-                                          className={`w-full pl-5 pr-2 py-1 text-xs text-right border rounded font-semibold focus:outline-none focus:ring-1 ${
-                                            theme === 'dark'
-                                              ? 'bg-slate-900 border-slate-600 text-white focus:ring-emerald-500'
-                                              : 'bg-white border-slate-200 text-slate-900 focus:ring-slate-900'
-                                          }`}
+                                          className="w-full pl-5 pr-2 py-1 text-xs text-right border rounded-lg font-semibold focus:outline-none"
                                         />
                                       </div>
                                     </div>
@@ -1953,26 +2608,24 @@ export default function App() {
                             )}
                           </div>
 
-                          {/* What Each Person Paid Table */}
+                          {/* Ledger Table */}
                           <div className="overflow-x-auto">
                             <table className="w-full text-left border-collapse min-w-[500px]">
                               <thead>
-                                <tr className={`border-b text-[11px] font-bold uppercase tracking-wider text-slate-400 ${
-                                  theme === 'dark' ? 'border-slate-800' : 'border-slate-200'
-                                }`}>
+                                <tr className="border-b border-slate-200/60 dark:border-slate-800/80 text-[11px] font-bold uppercase tracking-wider text-slate-400">
                                   <th className="py-2.5 px-3">Participant</th>
                                   <th className="py-2.5 px-3 text-right">What They Paid</th>
-                                  <th className="py-2.5 px-3 text-right">Their Fair Share</th>
-                                  <th className="py-2.5 px-3 text-right">Status / Paid Status</th>
+                                  <th className="py-2.5 px-3 text-right">Fair Share</th>
+                                  <th className="py-2.5 px-3 text-right">Net Balance</th>
                                 </tr>
                               </thead>
-                              <tbody className={`divide-y text-xs ${theme === 'dark' ? 'divide-slate-800' : 'divide-slate-100'}`}>
+                              <tbody className="divide-y divide-slate-100 dark:divide-slate-800/60 text-xs">
                                 {paymentBreakdown.payments.map((p) => {
                                   const getsBack = p.netBalance > 0.001;
                                   const owes = p.netBalance < -0.001;
                                   return (
-                                    <tr key={p.index} className={theme === 'dark' ? 'hover:bg-slate-800/40' : 'hover:bg-slate-50/50'}>
-                                      <td className={`py-3 px-3 font-semibold ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>
+                                    <tr key={p.index} className="hover:bg-slate-500/5">
+                                      <td className="py-3 px-3 font-semibold">
                                         <div className="flex items-center gap-1.5">
                                           <span>{p.name}</span>
                                           {p.isMarkedPaid && (
@@ -1990,17 +2643,17 @@ export default function App() {
                                       </td>
                                       <td className="py-3 px-3 text-right">
                                         {getsBack && (
-                                          <span className="inline-flex items-center gap-1 font-bold text-emerald-600 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950/40 px-2 py-0.5 rounded">
+                                          <span className="inline-flex items-center gap-1 font-bold text-emerald-600 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950/40 px-2 py-0.5 rounded-lg">
                                             Gets back +{formatRupee(p.netBalance)}
                                           </span>
                                         )}
                                         {owes && (
-                                          <span className="inline-flex items-center gap-1 font-bold text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/40 px-2 py-0.5 rounded">
+                                          <span className="inline-flex items-center gap-1 font-bold text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/40 px-2 py-0.5 rounded-lg">
                                             Owes {formatRupee(Math.abs(p.netBalance))}
                                           </span>
                                         )}
                                         {!getsBack && !owes && (
-                                          <span className="font-medium text-slate-400 bg-slate-100 dark:bg-slate-800 px-2 py-0.5 rounded">
+                                          <span className="font-medium text-slate-400 bg-slate-100 dark:bg-slate-800 px-2 py-0.5 rounded-lg">
                                             Settled (₹0.00)
                                           </span>
                                         )}
@@ -2012,43 +2665,53 @@ export default function App() {
                             </table>
                           </div>
 
-                          {/* Settlement Matrix (Who Pays Whom) */}
+                          {/* Direct Settlement Transfers with UPI QR Buttons */}
                           {paymentBreakdown.settlements.length > 0 && (
-                            <div className={`pt-3 border-t ${theme === 'dark' ? 'border-slate-800' : 'border-slate-100'}`}>
+                            <div className="pt-3 border-t border-slate-200/60 dark:border-slate-800/80">
                               <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400 mb-2.5">
-                                Settlement Transfers (Direct Pay Instructions):
+                                Direct Settlement Transfers:
                               </h4>
                               <div className="space-y-2">
                                 {paymentBreakdown.settlements.map((settle, sIdx) => (
                                   <div
                                     key={sIdx}
-                                    className={`p-3 border rounded-xl flex items-center justify-between text-xs ${
+                                    className={`p-3.5 border rounded-2xl flex items-center justify-between text-xs backdrop-blur-md ${
                                       settle.isSettled
-                                        ? theme === 'dark'
-                                          ? 'bg-emerald-950/20 border-emerald-800/40 opacity-75'
-                                          : 'bg-emerald-50/50 border-emerald-200 opacity-80'
+                                        ? 'bg-emerald-500/10 border-emerald-500/20 opacity-80'
                                         : theme === 'dark'
-                                        ? 'bg-slate-800 border-slate-700'
-                                        : 'bg-white border-slate-200'
+                                        ? 'bg-slate-800/40 border-slate-800/80'
+                                        : 'bg-white/80 border-slate-200/80'
                                     }`}
                                   >
                                     <div className="flex items-center gap-2">
-                                      <span className={`font-bold ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>
-                                        {settle.from}
-                                      </span>
+                                      <span className="font-bold">{settle.from}</span>
                                       <span className="text-slate-400">pays</span>
-                                      <span className={`font-bold ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>
-                                        {settle.to}
-                                      </span>
+                                      <span className="font-bold">{settle.to}</span>
                                       {settle.isSettled && (
-                                        <span className="text-[10px] font-bold px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-400 ml-1">
-                                          Received ✓
+                                        <span className="text-[10px] font-bold px-1.5 py-0.2 rounded-full bg-emerald-500/20 text-emerald-500 ml-1">
+                                          Paid ✓
                                         </span>
                                       )}
                                     </div>
-                                    <span className="font-mono font-extrabold text-sm text-emerald-500 bg-emerald-500/10 px-2.5 py-1 rounded-lg">
-                                      {formatRupee(settle.amount)}
-                                    </span>
+
+                                    <div className="flex items-center gap-2">
+                                      <span className="font-mono font-extrabold text-sm text-emerald-500 bg-emerald-500/10 px-2.5 py-1 rounded-xl">
+                                        {formatRupee(settle.amount)}
+                                      </span>
+
+                                      {/* One-click UPI QR Code for this exact transfer */}
+                                      <button
+                                        type="button"
+                                        onClick={() =>
+                                          handleOpenUpiModal(settle.to, settle.amount, settle.from)
+                                        }
+                                        title={`Pay ${settle.to} via UPI QR`}
+                                        className="p-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs flex items-center gap-1 shadow-xs transition cursor-pointer"
+                                      >
+                                        <QrCode className="w-3.5 h-3.5" />
+                                        <span className="hidden sm:inline">Pay UPI</span>
+                                      </button>
+                                    </div>
                                   </div>
                                 ))}
                               </div>
@@ -2065,71 +2728,70 @@ export default function App() {
         )}
 
         {/* ============================================================== */}
-        {/* VIEW 3: SPLIT HISTORY (Track past bills, dates & payments)     */}
+        {/* VIEW 3: SPLIT HISTORY                                          */}
         {/* ============================================================== */}
         {activeTab === 'history' && (
           <div className="space-y-6 animate-fade-in">
-            {/* History Header & Search */}
             <div
-              className={`rounded-2xl border p-6 shadow-sm transition-colors duration-200 ${
-                theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'
+              className={`rounded-3xl border p-6 backdrop-blur-xl shadow-lg transition-all ${
+                theme === 'dark'
+                  ? 'bg-slate-900/60 border-slate-800/80'
+                  : 'bg-white/70 border-white/60 shadow-slate-200/50'
               }`}
             >
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                 <div>
                   <h2 className="text-xl sm:text-2xl font-bold flex items-center gap-2">
                     <HistoryIcon className="w-5 h-5 text-emerald-500" />
-                    Split History & Tracking
+                    Split History & Ledger
                   </h2>
-                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-                    Every dinner split saved is recorded here. Click any record to reload it into the active calculator.
+                  <p className="text-xs text-slate-400 mt-1">
+                    Saved dinner bills with participant records and UPI settlement statuses.
                   </p>
                 </div>
 
-                {/* Search in History */}
                 <div className="relative w-full sm:w-64">
                   <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-slate-400">
                     <Search className="w-4 h-4" />
                   </div>
                   <input
                     type="text"
-                    placeholder="Search by occasion or name..."
+                    placeholder="Search occasion or name..."
                     value={historySearchQuery}
                     onChange={(e) => setHistorySearchQuery(e.target.value)}
-                    className={`w-full pl-9 pr-3 py-2 text-xs border rounded-xl focus:outline-none focus:ring-1 ${
+                    className={`w-full pl-9 pr-3 py-2 text-xs border rounded-2xl focus:outline-none focus:ring-1 focus:ring-emerald-500 ${
                       theme === 'dark'
-                        ? 'bg-slate-800 border-slate-700 text-white focus:ring-emerald-500'
-                        : 'bg-white border-slate-300 text-slate-900 focus:ring-slate-900'
+                        ? 'bg-slate-800/60 border-slate-700 text-white'
+                        : 'bg-white border-slate-200 text-slate-900'
                     }`}
                   />
                 </div>
               </div>
             </div>
 
-            {/* History List */}
             {filteredHistory.length > 0 ? (
               <div className="space-y-4">
                 {filteredHistory.map((item) => (
                   <div
                     key={item.id}
-                    className={`rounded-2xl border p-5 shadow-xs transition-colors hover:shadow-md ${
+                    className={`rounded-3xl border p-5 backdrop-blur-xl transition-all hover:scale-[1.005] ${
                       theme === 'dark'
-                        ? 'bg-slate-900 border-slate-800 hover:border-slate-700'
-                        : 'bg-white border-slate-200 hover:border-slate-300'
+                        ? 'bg-slate-900/60 border-slate-800/80'
+                        : 'bg-white/70 border-white/60 shadow-xs'
                     }`}
                   >
-                    <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-4 border-b border-slate-100 dark:border-slate-800">
+                    <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-4 border-b border-slate-200/50 dark:border-slate-800/80">
                       <div>
                         <div className="flex items-center gap-2 mb-1">
                           <h3 className="text-base font-bold">{item.occasion}</h3>
                           <span
                             className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
                               item.isFullySettled
-                                ? 'bg-emerald-500/20 text-emerald-600 dark:text-emerald-400'
-                                : 'bg-amber-500/20 text-amber-600 dark:text-amber-400'
+                                ? 'bg-emerald-500/20 text-emerald-500'
+                                : 'bg-amber-500/20 text-amber-500'
                             }`}
                           >
-                            {item.isFullySettled ? 'Fully Settled ✓' : 'Settlement Pending'}
+                            {item.isFullySettled ? 'Settled' : 'Pending'}
                           </span>
                         </div>
                         <p className="text-xs text-slate-400 flex items-center gap-1.5">
@@ -2148,12 +2810,12 @@ export default function App() {
                           </p>
                         </div>
 
-                        <div className="flex items-center gap-2 pl-3 border-l border-slate-100 dark:border-slate-800">
+                        <div className="flex items-center gap-2 pl-3 border-l border-slate-200/50 dark:border-slate-800/80">
                           <button
                             type="button"
                             onClick={() => handleRestoreHistoryItem(item)}
-                            title="Load into active splitter"
-                            className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs flex items-center gap-1 transition cursor-pointer"
+                            title="Load into splitter"
+                            className="px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs flex items-center gap-1 transition cursor-pointer"
                           >
                             <Split className="w-3.5 h-3.5" />
                             <span>Load</span>
@@ -2161,8 +2823,8 @@ export default function App() {
                           <button
                             type="button"
                             onClick={(e) => handleDeleteHistoryItem(item.id, e)}
-                            title="Delete this record"
-                            className="p-1.5 rounded-lg text-slate-400 hover:text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/30 transition cursor-pointer"
+                            title="Delete"
+                            className="p-1.5 rounded-xl text-slate-400 hover:text-rose-500 hover:bg-rose-500/10 transition cursor-pointer"
                           >
                             <Trash2 className="w-4 h-4" />
                           </button>
@@ -2170,33 +2832,24 @@ export default function App() {
                       </div>
                     </div>
 
-                    {/* Participant Shares Grid */}
+                    {/* Shares */}
                     <div className="mt-4">
-                      <p className="text-xs font-bold uppercase tracking-wider text-slate-400 mb-2">
-                        Shares & Payment Status:
-                      </p>
                       <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
                         {item.shares.map((s, idx) => (
                           <div
                             key={idx}
-                            className={`p-2 rounded-lg border text-xs flex items-center justify-between ${
+                            className={`p-2 rounded-xl border text-xs flex items-center justify-between ${
                               s.isPaid
-                                ? theme === 'dark'
-                                  ? 'bg-emerald-950/20 border-emerald-900/60'
-                                  : 'bg-emerald-50/70 border-emerald-200'
+                                ? 'bg-emerald-500/10 border-emerald-500/20'
                                 : theme === 'dark'
-                                ? 'bg-slate-800/60 border-slate-700'
-                                : 'bg-slate-50 border-slate-200'
+                                ? 'bg-slate-800/40 border-slate-700/50'
+                                : 'bg-white/80 border-slate-200/70'
                             }`}
                           >
                             <span className="truncate font-medium">{s.name}</span>
                             <div className="flex items-center gap-1 shrink-0 ml-1">
                               <span className="font-mono font-bold">{formatRupee(s.share)}</span>
-                              {s.isPaid ? (
-                                <Check className="w-3.5 h-3.5 text-emerald-500" />
-                              ) : (
-                                <span className="text-[10px] text-amber-500 font-bold">⏳</span>
-                              )}
+                              {s.isPaid && <Check className="w-3 h-3 text-emerald-500" />}
                             </div>
                           </div>
                         ))}
@@ -2207,70 +2860,26 @@ export default function App() {
               </div>
             ) : (
               <div
-                className={`rounded-2xl border-2 border-dashed p-12 text-center shadow-xs ${
-                  theme === 'dark' ? 'bg-slate-900/50 border-slate-800' : 'bg-white border-slate-300'
+                className={`rounded-3xl border-2 border-dashed p-12 text-center backdrop-blur-xl ${
+                  theme === 'dark' ? 'bg-slate-900/40 border-slate-800/80' : 'bg-white/50 border-slate-200'
                 }`}
               >
                 <HistoryIcon className="w-12 h-12 text-slate-400 mx-auto mb-3" />
-                <h3 className="text-base font-bold mb-1">No split history found</h3>
+                <h3 className="text-base font-bold mb-1">No records found</h3>
                 <p className="text-xs text-slate-400 max-w-sm mx-auto mb-4">
-                  {historySearchQuery
-                    ? `No split records matched "${historySearchQuery}". Try clearing search.`
-                    : 'Calculate a dinner split in the Splitter tab and click "Save to History" to track it here.'}
+                  {historySearchQuery ? 'No match found for your search query.' : 'Calculate and save a bill to view it in history.'}
                 </p>
                 <button
                   type="button"
                   onClick={() => setActiveTab('splitter')}
-                  className="px-4 py-2 rounded-xl bg-slate-900 dark:bg-emerald-500 text-white dark:text-slate-950 font-bold text-xs cursor-pointer"
+                  className="px-4 py-2 rounded-xl bg-emerald-600 text-white font-bold text-xs cursor-pointer"
                 >
-                  Go to Splitter
+                  Start New Split
                 </button>
               </div>
             )}
           </div>
         )}
-
-        {/* Feature Highlights Footer */}
-        <section className={`mt-16 pt-8 border-t ${theme === 'dark' ? 'border-slate-800' : 'border-slate-200'}`}>
-          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4 text-xs">
-            <div className={`p-4 rounded-xl border ${theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
-              <h4 className={`font-bold mb-1 flex items-center gap-1.5 ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>
-                <LayoutDashboard className="w-4 h-4 text-emerald-500" />
-                Feature Dashboard
-              </h4>
-              <p className="text-slate-400 leading-relaxed">
-                Centralized dashboard showing metrics, collection progress, active bill status, and quick shortcuts.
-              </p>
-            </div>
-            <div className={`p-4 rounded-xl border ${theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
-              <h4 className={`font-bold mb-1 flex items-center gap-1.5 ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>
-                <HistoryIcon className="w-4 h-4 text-emerald-500" />
-                Split History Tracking
-              </h4>
-              <p className="text-slate-400 leading-relaxed">
-                Save and track past dinner splits with exact participant shares, dates, and settlement records.
-              </p>
-            </div>
-            <div className={`p-4 rounded-xl border ${theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
-              <h4 className={`font-bold mb-1 flex items-center gap-1.5 ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>
-                <ShieldCheck className="w-4 h-4 text-emerald-500" />
-                Reload Immune Persistence
-              </h4>
-              <p className="text-slate-400 leading-relaxed">
-                Reloading or refreshing the page will never wipe your data. Refresh safely recalculates.
-              </p>
-            </div>
-            <div className={`p-4 rounded-xl border ${theme === 'dark' ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
-              <h4 className={`font-bold mb-1 flex items-center gap-1.5 ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>
-                <Trash2 className="w-4 h-4 text-rose-500" />
-                &apos;Clear All&apos; Button
-              </h4>
-              <p className="text-slate-400 leading-relaxed">
-                Cleanly wipe all calculations and active data when dinner is finished and settled.
-              </p>
-            </div>
-          </div>
-        </section>
       </main>
     </div>
   );
